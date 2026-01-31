@@ -9,7 +9,7 @@ Provides endpoints for:
 - Built-in background scheduler for autonomous mode
 """
 from datetime import datetime, timedelta
-from typing import Optional, List
+from typing import Optional, List, Dict
 import json
 import logging
 
@@ -32,6 +32,68 @@ logger = logging.getLogger(__name__)
 
 # Global scheduler
 scheduler = AsyncIOScheduler()
+
+
+# Default intervals (minutes)
+DEFAULT_INTERVALS = {"post": 45, "comment": 10, "reply": 8, "upvote": 15, "watcher": 5}
+
+# Job name -> function mapping
+JOB_FUNCTIONS = {
+    "post": ("post_job", None),
+    "comment": ("comment_job", None),
+    "reply": ("reply_job", None),
+    "upvote": ("upvote_job", None),
+    "watcher": ("new_post_watcher", None),
+}
+
+
+def get_intervals() -> dict:
+    """Get job intervals from Firestore config, with defaults."""
+    try:
+        db = get_firestore()
+        config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
+        if config_doc.exists:
+            stored = config_doc.to_dict().get("intervals", {})
+            merged = {**DEFAULT_INTERVALS, **stored}
+            return merged
+    except:
+        pass
+    return DEFAULT_INTERVALS.copy()
+
+
+def reschedule_jobs():
+    """Reschedule all jobs based on current Firestore intervals."""
+    intervals = get_intervals()
+    
+    job_map = {
+        "post": post_job,
+        "comment": comment_job,
+        "reply": reply_job,
+        "upvote": upvote_job,
+        "watcher": new_post_watcher,
+    }
+    
+    job_id_map = {
+        "post": "post_job",
+        "comment": "comment_job",
+        "reply": "reply_job",
+        "upvote": "upvote_job",
+        "watcher": "new_post_watcher",
+    }
+    
+    for name, minutes in intervals.items():
+        job_id = job_id_map.get(name)
+        func = job_map.get(name)
+        if job_id and func and minutes > 0:
+            scheduler.add_job(func, IntervalTrigger(minutes=minutes), id=job_id, replace_existing=True)
+            logger.info(f"Scheduled {job_id} every {minutes}m")
+        elif minutes == 0 and job_id:
+            # Disable job
+            try:
+                scheduler.remove_job(job_id)
+                logger.info(f"Disabled {job_id}")
+            except:
+                pass
 
 
 # ==================== Scheduler Jobs ====================
@@ -813,23 +875,17 @@ def startup_check():
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting scheduler...")
-    # Karma-optimized intervals:
-    # - Posts less frequently (quality over quantity)
-    # - Comments more frequently (builds relationships)
-    # - Replies quickly (shows engagement)
-    # - Upvotes regularly (community participation)
-    scheduler.add_job(post_job, IntervalTrigger(minutes=45), id="post_job", replace_existing=True)
-    scheduler.add_job(comment_job, IntervalTrigger(minutes=10), id="comment_job", replace_existing=True)
-    scheduler.add_job(reply_job, IntervalTrigger(minutes=8), id="reply_job", replace_existing=True)
-    scheduler.add_job(upvote_job, IntervalTrigger(minutes=15), id="upvote_job", replace_existing=True)
-    scheduler.add_job(new_post_watcher, IntervalTrigger(minutes=5), id="new_post_watcher", replace_existing=True)
+    
+    # Use dynamic intervals from Firestore
+    reschedule_jobs()
     
     # Run health check 10 seconds after startup
     from apscheduler.triggers.date import DateTrigger
     scheduler.add_job(startup_check, DateTrigger(run_date=datetime.now() + timedelta(seconds=10)), id="startup_check")
     
     scheduler.start()
-    logger.info("Scheduler started with post(45m), comment(3m), reply(8m), upvote(15m), new_post_watcher(2m) jobs")
+    intervals = get_intervals()
+    logger.info(f"Scheduler started with dynamic intervals: {intervals}")
     
     yield
     
@@ -882,6 +938,7 @@ class ConfigUpdate(BaseModel):
     heartbeat_interval_hours: Optional[int] = None
     max_posts_per_day: Optional[int] = None
     post_topics: Optional[List[str]] = None
+    intervals: Optional[Dict] = None  # {"post": 45, "comment": 10, "reply": 8, "upvote": 15, "watcher": 5}
 
 
 # ==================== Endpoints ====================
@@ -1012,12 +1069,13 @@ async def root():
         scheduler_status = "Running" if scheduler.running else "Stopped"
         scheduler_class = "status-online" if scheduler.running else "status-offline"
         
+        current_intervals = get_intervals()
         job_details = {
-            "post": {"interval": "45 min", "desc": "Creates engaging posts on interesting topics", "icon": "📝"},
-            "comment": {"interval": "10 min", "desc": "Comments on posts to build relationships", "icon": "💬"},
-            "reply": {"interval": "8 min", "desc": "Replies to comments on your posts quickly", "icon": "↩️"},
-            "upvote": {"interval": "15 min", "desc": "Upvotes quality content from the community", "icon": "👍"},
-            "new_post_watcher": {"interval": "5 min", "desc": "Watches for new posts and comments first", "icon": "👀"},
+            "post": {"interval": f"{current_intervals.get('post', 45)} min", "desc": "Creates engaging posts on interesting topics", "icon": "📝"},
+            "comment": {"interval": f"{current_intervals.get('comment', 10)} min", "desc": "Comments on posts to build relationships", "icon": "💬"},
+            "reply": {"interval": f"{current_intervals.get('reply', 8)} min", "desc": "Replies to comments on your posts quickly", "icon": "↩️"},
+            "upvote": {"interval": f"{current_intervals.get('upvote', 15)} min", "desc": "Upvotes quality content from the community", "icon": "👍"},
+            "new_post_watcher": {"interval": f"{current_intervals.get('watcher', 5)} min", "desc": "Watches for new posts and comments first", "icon": "👀"},
         }
         
         next_jobs = []
@@ -1768,10 +1826,16 @@ async def update_config(request: ConfigUpdate):
         update_data["max_posts_per_day"] = request.max_posts_per_day
     if request.post_topics is not None:
         update_data["post_topics"] = request.post_topics
+    if request.intervals is not None:
+        update_data["intervals"] = request.intervals
     
     if update_data:
         update_data["updated_at"] = datetime.now()
         db.collection(MOLTBOOK_CONFIG).document("settings").set(update_data, merge=True)
+    
+    # Reschedule if intervals changed
+    if request.intervals is not None:
+        reschedule_jobs()
     
     return {"success": True, "updated": update_data}
 
@@ -1788,7 +1852,8 @@ async def get_config():
         "autonomous_mode": config_data.get("autonomous_mode", False),
         "heartbeat_interval_hours": config_data.get("heartbeat_interval_hours", 4),
         "max_posts_per_day": config_data.get("max_posts_per_day", 6),
-        "post_topics": config_data.get("post_topics", [])
+        "post_topics": config_data.get("post_topics", []),
+        "intervals": {**DEFAULT_INTERVALS, **config_data.get("intervals", {})}
     }
 
 
