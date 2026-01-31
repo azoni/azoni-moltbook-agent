@@ -76,6 +76,38 @@ def can_post() -> bool:
         return False
 
 
+def get_next_post_topic() -> str:
+    """Get and consume the next topic from the queue, or return default."""
+    try:
+        db = get_firestore()
+        config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
+        config_data = config_doc.to_dict() if config_doc.exists else {}
+        topics = config_data.get("post_topics", [])
+        
+        if topics:
+            # Pop the first topic
+            next_topic = topics.pop(0)
+            # Update the queue
+            db.collection(MOLTBOOK_CONFIG).document("settings").set({
+                "post_topics": topics
+            }, merge=True)
+            return next_topic
+        
+        # Default topics if queue is empty
+        import random
+        default_topics = [
+            "Share something interesting you learned while building AI applications",
+            "Discuss a challenge you faced recently and how you solved it",
+            "Share thoughts on the current AI agent ecosystem",
+            "Talk about a useful tool or technique you've been using",
+            "Reflect on building in public and shipping real products",
+        ]
+        return random.choice(default_topics)
+    except Exception as e:
+        logger.error(f"Error getting post topic: {e}")
+        return "Share something interesting about AI, coding, or your projects"
+
+
 def post_job():
     """Create new posts every 35 minutes."""
     logger.info(f"Post job triggered at {datetime.now()}")
@@ -88,10 +120,14 @@ def post_job():
         logger.info("Post cooldown active, skipping")
         return
     
+    # Get the next topic
+    topic = get_next_post_topic()
+    logger.info(f"Post topic: {topic}")
+    
     try:
         result = run_agent(
             trigger="heartbeat",
-            trigger_context="Create a new post about AI, coding, or your projects. Be authentic."
+            trigger_context=f"Create a new post about: {topic}. Be authentic and add value."
         )
         logger.info(f"Post job: {result.get('decision', {}).get('action')}, executed={result.get('executed')}")
     except Exception as e:
@@ -330,6 +366,7 @@ class ConfigUpdate(BaseModel):
     autonomous_mode: Optional[bool] = None
     heartbeat_interval_hours: Optional[int] = None
     max_posts_per_day: Optional[int] = None
+    post_topics: Optional[List[str]] = None
 
 
 # ==================== Endpoints ====================
@@ -376,6 +413,16 @@ async def get_status():
         .where("date", "==", today)
         .limit(10).get())
     
+    # Get scheduler info
+    scheduler_jobs = []
+    if scheduler.running:
+        for job in scheduler.get_jobs():
+            next_run = job.next_run_time.isoformat() if job.next_run_time else None
+            scheduler_jobs.append({
+                "id": job.id,
+                "next_run": next_run
+            })
+    
     return {
         "registered": moltbook_registered,
         "moltbook_status": moltbook_status,
@@ -384,7 +431,9 @@ async def get_status():
         "last_run_at": state_data.get("last_run_at"),
         "last_activity": state_data.get("last_activity"),
         "posts_today": len(posts_today),
-        "heartbeat_interval_hours": config_data.get("heartbeat_interval_hours", 4)
+        "heartbeat_interval_hours": config_data.get("heartbeat_interval_hours", 4),
+        "scheduler_running": scheduler.running,
+        "scheduler_jobs": scheduler_jobs
     }
 
 
@@ -576,6 +625,8 @@ async def update_config(request: ConfigUpdate):
         update_data["heartbeat_interval_hours"] = request.heartbeat_interval_hours
     if request.max_posts_per_day is not None:
         update_data["max_posts_per_day"] = request.max_posts_per_day
+    if request.post_topics is not None:
+        update_data["post_topics"] = request.post_topics
     
     if update_data:
         update_data["updated_at"] = datetime.now()
@@ -595,8 +646,49 @@ async def get_config():
     return {
         "autonomous_mode": config_data.get("autonomous_mode", False),
         "heartbeat_interval_hours": config_data.get("heartbeat_interval_hours", 4),
-        "max_posts_per_day": config_data.get("max_posts_per_day", 6)
+        "max_posts_per_day": config_data.get("max_posts_per_day", 6),
+        "post_topics": config_data.get("post_topics", [])
     }
+
+
+# ==================== Post Topics Queue ====================
+
+@app.get("/topics")
+async def get_topics():
+    """Get the post topics queue."""
+    db = get_firestore()
+    config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
+    config_data = config_doc.to_dict() if config_doc.exists else {}
+    return {"topics": config_data.get("post_topics", [])}
+
+
+@app.post("/topics")
+async def add_topic(topic: str):
+    """Add a topic to the queue."""
+    db = get_firestore()
+    from google.cloud.firestore import ArrayUnion
+    db.collection(MOLTBOOK_CONFIG).document("settings").set({
+        "post_topics": ArrayUnion([topic])
+    }, merge=True)
+    return {"success": True, "added": topic}
+
+
+@app.delete("/topics/{index}")
+async def remove_topic(index: int):
+    """Remove a topic by index (0-based)."""
+    db = get_firestore()
+    config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
+    config_data = config_doc.to_dict() if config_doc.exists else {}
+    topics = config_data.get("post_topics", [])
+    
+    if 0 <= index < len(topics):
+        removed = topics.pop(index)
+        db.collection(MOLTBOOK_CONFIG).document("settings").set({
+            "post_topics": topics
+        }, merge=True)
+        return {"success": True, "removed": removed}
+    else:
+        raise HTTPException(status_code=404, detail="Topic index not found")
 
 
 @app.get("/profile")
