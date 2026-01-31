@@ -280,6 +280,7 @@ def upvote_job():
         
         # Get hot posts
         feed = client.get_feed(sort="hot", limit=10)
+        upvoted = 0
         
         for post in feed:
             post_id = post.get("id")
@@ -312,7 +313,11 @@ def upvote_job():
                 })
                 
                 logger.info(f"Upvoted: {post.get('title', 'Unknown')[:50]}")
-                return  # Only upvote one per run
+                upvoted += 1
+                if upvoted >= 3:  # Upvote up to 3 per run
+                    return
+                import time
+                time.sleep(1)
                 
             except Exception as e:
                 logger.error(f"Failed to upvote {post_id}: {e}")

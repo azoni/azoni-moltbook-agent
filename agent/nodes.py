@@ -164,7 +164,8 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
     ])
     force_comment = any(phrase in trigger_context for phrase in [
         "comment on", "reply to", "respond to", "leave a comment",
-        "action: comment", "force comment"
+        "action: comment", "force comment", "find an interesting post",
+        "find a post", "do not create a new post", "add value"
     ])
     
     # Parse the decision
@@ -175,31 +176,78 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
         "target_submolt": None
     }
     
+    feed = state.get("feed", [])
+    
+    # Helper: find best post to comment on from feed
+    def find_target_post(response_text: str, feed: list) -> str:
+        """Try multiple strategies to match a post from the feed."""
+        # Strategy 1: Check if LLM mentioned a post title
+        for post in feed:
+            title = post.get("title", "").lower()
+            if title and len(title) > 5 and title[:20] in response_text:
+                return post.get("id")
+        
+        # Strategy 2: Check if LLM mentioned a post ID
+        for post in feed:
+            post_id = post.get("id", "")
+            if post_id and post_id in response.content:
+                return post_id
+        
+        # Strategy 3: Pick the best post we haven't commented on yet
+        # Prefer posts with fewer comments (more room to add value)
+        # and skip our own posts
+        scored = []
+        for post in feed:
+            author = post.get("author", "")
+            if isinstance(author, dict):
+                author = author.get("name", "")
+            if author.lower() in ["azoni-ai", "azoni"]:
+                continue
+            
+            # Score: prefer fewer comments, some upvotes, recent
+            comment_count = post.get("comment_count", 0)
+            upvotes = post.get("upvotes", 0)
+            score = max(0, 5 - comment_count) + min(upvotes, 3)
+            scored.append((score, post.get("id")))
+        
+        if scored:
+            scored.sort(reverse=True)
+            return scored[0][1]
+        
+        # Strategy 4: Just pick the first non-self post
+        for post in feed:
+            author = post.get("author", "")
+            if isinstance(author, dict):
+                author = author.get("name", "")
+            if author.lower() not in ["azoni-ai", "azoni"]:
+                return post.get("id")
+        
+        return None
+    
     # If context is forcing an action, respect that (override LLM decision)
     if force_post:
         decision["action"] = "post"
         decision["reason"] = f"Forced post action from context: {trigger_context}"
     elif force_comment:
         decision["action"] = "comment"
-        for post in state.get("feed", []):
-            if post.get("title", "").lower() in response_text or post.get("id", "") in response.content:
-                decision["target_post_id"] = post.get("id")
-                break
+        decision["target_post_id"] = find_target_post(response_text, feed)
+        decision["reason"] = f"Forced comment action from context: {trigger_context}"
     elif "\"post\"" in response_text or "action: post" in response_text or "decide to post" in response_text or "create a post" in response_text:
         decision["action"] = "post"
-    elif "\"comment\"" in response_text or "action: comment" in response_text or "decide to comment" in response_text:
+    elif "\"comment\"" in response_text or "action: comment" in response_text or "decide to comment" in response_text or "comment on" in response_text:
         decision["action"] = "comment"
-        # Try to extract target post
-        for post in state.get("feed", []):
-            if post.get("title", "").lower() in response_text or post.get("id", "") in response.content:
-                decision["target_post_id"] = post.get("id")
-                break
+        decision["target_post_id"] = find_target_post(response_text, feed)
     elif "\"upvote\"" in response_text or "action: upvote" in response_text:
         decision["action"] = "upvote"
-        for post in state.get("feed", []):
-            if post.get("title", "").lower() in response_text or post.get("id", "") in response.content:
-                decision["target_post_id"] = post.get("id")
-                break
+        decision["target_post_id"] = find_target_post(response_text, feed)
+    
+    # Safety: if we decided to comment but have no target, pick one
+    if decision["action"] == "comment" and not decision["target_post_id"] and feed:
+        decision["target_post_id"] = find_target_post("", feed)
+    
+    # Safety: if we decided to upvote but have no target, pick one
+    if decision["action"] == "upvote" and not decision["target_post_id"] and feed:
+        decision["target_post_id"] = find_target_post("", feed)
     
     return {
         "decision": decision,
