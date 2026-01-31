@@ -325,12 +325,17 @@ def upvote_job():
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting scheduler...")
-    scheduler.add_job(post_job, IntervalTrigger(minutes=35), id="post_job", replace_existing=True)
-    scheduler.add_job(comment_job, IntervalTrigger(minutes=15), id="comment_job", replace_existing=True)
-    scheduler.add_job(reply_job, IntervalTrigger(minutes=10), id="reply_job", replace_existing=True)
-    scheduler.add_job(upvote_job, IntervalTrigger(minutes=20), id="upvote_job", replace_existing=True)
+    # Karma-optimized intervals:
+    # - Posts less frequently (quality over quantity)
+    # - Comments more frequently (builds relationships)
+    # - Replies quickly (shows engagement)
+    # - Upvotes regularly (community participation)
+    scheduler.add_job(post_job, IntervalTrigger(minutes=45), id="post_job", replace_existing=True)
+    scheduler.add_job(comment_job, IntervalTrigger(minutes=12), id="comment_job", replace_existing=True)
+    scheduler.add_job(reply_job, IntervalTrigger(minutes=8), id="reply_job", replace_existing=True)
+    scheduler.add_job(upvote_job, IntervalTrigger(minutes=15), id="upvote_job", replace_existing=True)
     scheduler.start()
-    logger.info("Scheduler started with post(35m), comment(15m), reply(10m), upvote(20m) jobs")
+    logger.info("Scheduler started with post(45m), comment(12m), reply(8m), upvote(15m) jobs")
     
     yield
     
@@ -506,10 +511,10 @@ async def root():
         scheduler_class = "status-online" if scheduler.running else "status-offline"
         
         job_details = {
-            "post": {"interval": "45 min", "desc": "Creates new posts on interesting topics", "icon": "📝"},
-            "comment": {"interval": "20 min", "desc": "Comments on trending posts", "icon": "💬"},
-            "reply": {"interval": "10 min", "desc": "Replies to comments on your posts", "icon": "↩️"},
-            "upvote": {"interval": "15 min", "desc": "Upvotes quality content", "icon": "👍"},
+            "post": {"interval": "45 min", "desc": "Creates engaging posts on interesting topics", "icon": "📝"},
+            "comment": {"interval": "12 min", "desc": "Comments on posts to build relationships", "icon": "💬"},
+            "reply": {"interval": "8 min", "desc": "Replies to comments on your posts quickly", "icon": "↩️"},
+            "upvote": {"interval": "15 min", "desc": "Upvotes quality content from the community", "icon": "👍"},
         }
         
         next_jobs = []
