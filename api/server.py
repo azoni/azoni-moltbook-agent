@@ -13,7 +13,7 @@ from typing import Optional, List, Dict
 import json
 import logging
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -36,6 +36,16 @@ scheduler = AsyncIOScheduler()
 
 # Default intervals (minutes)
 DEFAULT_INTERVALS = {"post": 45, "comment": 10, "reply": 8, "upvote": 15, "watcher": 5}
+
+
+def require_admin(x_admin_key: Optional[str] = Header(None)):
+    """Dependency that checks for admin API key on protected endpoints."""
+    if not settings.admin_api_key:
+        # No key configured = no protection (dev mode)
+        return True
+    if x_admin_key != settings.admin_api_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Admin-Key header")
+    return True
 
 # Job name -> function mapping
 JOB_FUNCTIONS = {
@@ -1647,7 +1657,20 @@ async def root():
             <script>
                 setTimeout(function() {{ location.reload(); }}, 60000);
                 
+                let adminKey = sessionStorage.getItem('adminKey') || '';
+                
+                function getAdminKey() {{
+                    if (!adminKey) {{
+                        adminKey = prompt('Enter admin key:');
+                        if (adminKey) sessionStorage.setItem('adminKey', adminKey);
+                    }}
+                    return adminKey;
+                }}
+                
                 async function saveIntervals() {{
+                    const key = getAdminKey();
+                    if (!key) return;
+                    
                     const btn = document.querySelector('.btn');
                     const status = document.getElementById('save-status');
                     btn.disabled = true;
@@ -1662,14 +1685,27 @@ async def root():
                     try {{
                         const res = await fetch('/config', {{
                             method: 'PATCH',
-                            headers: {{'Content-Type': 'application/json'}},
+                            headers: {{
+                                'Content-Type': 'application/json',
+                                'X-Admin-Key': adminKey
+                            }},
                             body: JSON.stringify({{intervals}})
                         }});
-                        const data = await res.json();
-                        if (data.success) {{
+                        
+                        if (res.status === 401) {{
+                            adminKey = '';
+                            sessionStorage.removeItem('adminKey');
                             status.style.opacity = '1';
-                            status.textContent = '✓ Saved & rescheduled';
-                            setTimeout(() => {{ status.style.opacity = '0'; }}, 3000);
+                            status.style.color = '#f87171';
+                            status.textContent = '✗ Bad key';
+                            setTimeout(() => {{ status.style.opacity = '0'; status.style.color = '#4ade80'; }}, 3000);
+                        }} else {{
+                            const data = await res.json();
+                            if (data.success) {{
+                                status.style.opacity = '1';
+                                status.textContent = '✓ Saved & rescheduled';
+                                setTimeout(() => {{ status.style.opacity = '0'; }}, 3000);
+                            }}
                         }}
                     }} catch(e) {{
                         status.style.opacity = '1';
@@ -1759,7 +1795,7 @@ async def get_status():
     }
 
 
-@app.post("/register")
+@app.post("/register", dependencies=[Depends(require_admin)])
 async def register_agent(request: RegisterRequest):
     """
     Register Azoni on Moltbook.
@@ -1795,7 +1831,7 @@ async def register_agent(request: RegisterRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/run")
+@app.post("/run", dependencies=[Depends(require_admin)])
 async def manual_run(request: ManualRunRequest, background_tasks: BackgroundTasks):
     """
     Manually trigger an agent run.
@@ -1818,7 +1854,7 @@ async def manual_run(request: ManualRunRequest, background_tasks: BackgroundTask
     }
 
 
-@app.post("/run/sync")
+@app.post("/run/sync", dependencies=[Depends(require_admin)])
 async def manual_run_sync(request: ManualRunRequest):
     """
     Manually trigger an agent run (synchronous - waits for completion).
@@ -1839,7 +1875,7 @@ async def manual_run_sync(request: ManualRunRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/post")
+@app.post("/post", dependencies=[Depends(require_admin)])
 async def direct_post(request: PostRequest):
     """
     Directly post to Moltbook (bypasses agent decision-making).
@@ -1871,7 +1907,7 @@ async def direct_post(request: PostRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/comment")
+@app.post("/comment", dependencies=[Depends(require_admin)])
 async def direct_comment(request: CommentRequest):
     """
     Directly comment on a post (bypasses agent decision-making).
@@ -1935,7 +1971,7 @@ async def get_activity(limit: int = 50):
     return {"activity": activity}
 
 
-@app.patch("/config")
+@app.patch("/config", dependencies=[Depends(require_admin)])
 async def update_config(request: ConfigUpdate):
     """Update agent configuration."""
     db = get_firestore()
@@ -1988,7 +2024,7 @@ async def get_topics():
     return {"topics": config_data.get("post_topics", [])}
 
 
-@app.post("/topics")
+@app.post("/topics", dependencies=[Depends(require_admin)])
 async def add_topic(topic: str):
     """Add a topic to the queue."""
     db = get_firestore()
@@ -1999,7 +2035,7 @@ async def add_topic(topic: str):
     return {"success": True, "added": topic}
 
 
-@app.delete("/topics/{index}")
+@app.delete("/topics/{index}", dependencies=[Depends(require_admin)])
 async def remove_topic(index: int):
     """Remove a topic by index (0-based)."""
     db = get_firestore()
@@ -2055,7 +2091,7 @@ async def get_job_history():
         return {"error": str(e)}
 
 
-@app.post("/debug/comment")
+@app.post("/debug/comment", dependencies=[Depends(require_admin)])
 async def debug_comment():
     """Debug: Run comment job directly and return verbose output."""
     import io
@@ -2077,7 +2113,7 @@ async def debug_comment():
     return {"logs": log_capture.getvalue()}
 
 
-@app.post("/debug/post")
+@app.post("/debug/post", dependencies=[Depends(require_admin)])
 async def debug_post():
     """Debug: Run post job directly and return verbose output."""
     import io

@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     moltbook_base_url: str = "https://www.moltbook.com/api/v1"
     moltbook_agent_name: str = "Azoni"
     
+    # Admin
+    admin_api_key: Optional[str] = None
+    
     # LLM Provider (OpenRouter for flexibility)
     openrouter_api_key: str
     default_model: str = "openai/gpt-4o-mini"
