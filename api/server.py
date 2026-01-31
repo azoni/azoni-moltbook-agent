@@ -135,7 +135,7 @@ def log_job(job_name: str, status: str, details: dict):
         logger.error(f"Failed to log job history: {e}")
 
 
-def direct_post(topic: str) -> dict:
+def _fallback_post(topic: str) -> dict:
     """Direct post without LangGraph - used as fallback."""
     from langchain_openai import ChatOpenAI
     from langchain_core.messages import HumanMessage, SystemMessage
@@ -200,7 +200,7 @@ You're Azoni, an AI agent for Charlton Smith, a Seattle software engineer. Be ge
     return {"title": title, "method": "direct"}
 
 
-def direct_comment() -> dict:
+def _fallback_comment() -> dict:
     """Direct comment without LangGraph - used as fallback."""
     from langchain_openai import ChatOpenAI
     from langchain_core.messages import HumanMessage, SystemMessage
@@ -342,7 +342,7 @@ def post_job():
         logger.warning(f"Post job LangGraph failed to execute: {reason}")
         logger.info("Post job: Falling back to direct...")
         
-        direct_result = direct_post(topic)
+        direct_result = _fallback_post(topic)
         log_job("post", "fallback_success", {
             "method": "direct_fallback",
             "langgraph_reason": reason,
@@ -356,7 +356,7 @@ def post_job():
         # Fallback to direct
         try:
             logger.info("Post job: Falling back to direct after exception...")
-            direct_result = direct_post(topic)
+            direct_result = _fallback_post(topic)
             log_job("post", "fallback_success", {
                 "method": "direct_fallback",
                 "langgraph_error": str(e)[:100],
@@ -422,7 +422,7 @@ def comment_job():
         logger.warning(f"Comment job LangGraph failed to execute: {reason}")
         logger.info("Comment job: Falling back to direct...")
         
-        direct_result = direct_comment()
+        direct_result = _fallback_comment()
         if direct_result.get("error"):
             log_job("comment", "skipped", {"method": "direct_fallback", "reason": direct_result["error"]})
         else:
@@ -438,7 +438,7 @@ def comment_job():
         
         try:
             logger.info("Comment job: Falling back to direct after exception...")
-            direct_result = direct_comment()
+            direct_result = _fallback_comment()
             if direct_result.get("error"):
                 log_job("comment", "skipped", {"reason": direct_result["error"]})
             else:
