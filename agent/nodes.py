@@ -159,9 +159,13 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
     trigger_context = (state.get("trigger_context") or "").lower()
     force_post = any(phrase in trigger_context for phrase in [
         "create a new post", "make a post", "write a post", "post about",
-        "introduce yourself", "share something"
+        "introduce yourself", "share something", "new post", "force post",
+        "must post", "should post", "please post", "do a post", "action: post"
     ])
-    force_comment = "comment on" in trigger_context or "reply to" in trigger_context
+    force_comment = any(phrase in trigger_context for phrase in [
+        "comment on", "reply to", "respond to", "leave a comment",
+        "action: comment", "force comment"
+    ])
     
     # Parse the decision
     decision: AgentDecision = {
@@ -171,9 +175,10 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
         "target_submolt": None
     }
     
-    # If context is forcing an action, respect that
+    # If context is forcing an action, respect that (override LLM decision)
     if force_post:
         decision["action"] = "post"
+        decision["reason"] = f"Forced post action from context: {trigger_context}"
     elif force_comment:
         decision["action"] = "comment"
         for post in state.get("feed", []):

@@ -15,6 +15,7 @@ import logging
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
@@ -371,14 +372,299 @@ class ConfigUpdate(BaseModel):
 
 # ==================== Endpoints ====================
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 async def root():
-    """Health check."""
-    return {
-        "status": "ok",
-        "agent": "Azoni",
-        "service": "Moltbook Agent"
-    }
+    """Beautiful status dashboard."""
+    db = get_firestore()
+    
+    # Get state
+    state_doc = db.collection(MOLTBOOK_STATE).document("agent").get()
+    state_data = state_doc.to_dict() if state_doc.exists else {}
+    
+    # Get config
+    config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
+    config_data = config_doc.to_dict() if config_doc.exists else {}
+    
+    # Check Moltbook connection
+    moltbook_status = "Not connected"
+    moltbook_class = "status-offline"
+    if settings.moltbook_api_key:
+        try:
+            client = get_moltbook_client()
+            status_response = client.get_status()
+            if status_response.get("status") == "claimed":
+                moltbook_status = "Connected"
+                moltbook_class = "status-online"
+            else:
+                moltbook_status = status_response.get("status", "Unknown")
+        except Exception as e:
+            moltbook_status = f"Error: {str(e)[:30]}"
+    
+    # Get recent activity
+    activity_docs = db.collection(MOLTBOOK_ACTIVITY)\
+        .order_by("timestamp", direction="DESCENDING")\
+        .limit(10).get()
+    
+    activities = []
+    for doc in activity_docs:
+        data = doc.to_dict()
+        ts = data.get("timestamp")
+        time_str = ts.strftime("%I:%M %p") if ts else "Unknown"
+        date_str = ts.strftime("%b %d") if ts else ""
+        
+        # Get link
+        post_id = None
+        if data.get("result", {}).get("post", {}).get("id"):
+            post_id = data["result"]["post"]["id"]
+        elif data.get("result", {}).get("comment", {}).get("post_id"):
+            post_id = data["result"]["comment"]["post_id"]
+        elif data.get("result", {}).get("id"):
+            post_id = data["result"]["id"]
+        
+        link = f"https://www.moltbook.com/post/{post_id}" if post_id else None
+        
+        activities.append({
+            "action": data.get("action", "unknown"),
+            "time": time_str,
+            "date": date_str,
+            "title": data.get("draft", {}).get("title", "")[:40] if data.get("draft") else "",
+            "error": data.get("error"),
+            "link": link
+        })
+    
+    # Count today's activity
+    today = datetime.now().date().isoformat()
+    posts_today = len(list(db.collection(MOLTBOOK_ACTIVITY)
+        .where("action", "==", "post")
+        .where("date", "==", today)
+        .limit(50).get()))
+    comments_today = len(list(db.collection(MOLTBOOK_ACTIVITY)
+        .where("action", "==", "comment")
+        .where("date", "==", today)
+        .limit(50).get()))
+    
+    # Scheduler info
+    scheduler_status = "Running" if scheduler.running else "Stopped"
+    next_jobs = []
+    if scheduler.running:
+        for job in scheduler.get_jobs():
+            if job.next_run_time:
+                next_jobs.append({
+                    "id": job.id.replace("_job", "").title(),
+                    "next": job.next_run_time.strftime("%I:%M %p")
+                })
+    
+    # Autonomous mode
+    auto_mode = config_data.get("autonomous_mode", False)
+    auto_class = "status-online" if auto_mode else "status-offline"
+    auto_text = "Enabled" if auto_mode else "Disabled"
+    
+    # Topics queue
+    topics = config_data.get("post_topics", [])
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Azoni-AI | Moltbook Agent</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                min-height: 100vh;
+                color: #e0e0e0;
+                padding: 2rem;
+            }}
+            .container {{ max-width: 900px; margin: 0 auto; }}
+            .header {{
+                text-align: center;
+                margin-bottom: 2rem;
+                padding: 2rem;
+                background: rgba(255,255,255,0.05);
+                border-radius: 16px;
+                border: 1px solid rgba(255,255,255,0.1);
+            }}
+            .header h1 {{
+                font-size: 2.5rem;
+                background: linear-gradient(90deg, #ff6b6b, #ffa500);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                margin-bottom: 0.5rem;
+            }}
+            .header p {{ color: #888; }}
+            .grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 1rem;
+                margin-bottom: 2rem;
+            }}
+            .card {{
+                background: rgba(255,255,255,0.05);
+                border-radius: 12px;
+                padding: 1.5rem;
+                border: 1px solid rgba(255,255,255,0.1);
+            }}
+            .card h3 {{
+                font-size: 0.85rem;
+                color: #888;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                margin-bottom: 0.5rem;
+            }}
+            .card .value {{
+                font-size: 1.5rem;
+                font-weight: 600;
+            }}
+            .status-online {{ color: #4ade80; }}
+            .status-offline {{ color: #f87171; }}
+            .activity {{
+                background: rgba(255,255,255,0.05);
+                border-radius: 12px;
+                padding: 1.5rem;
+                border: 1px solid rgba(255,255,255,0.1);
+                margin-bottom: 2rem;
+            }}
+            .activity h2 {{
+                margin-bottom: 1rem;
+                font-size: 1.2rem;
+            }}
+            .activity-item {{
+                display: flex;
+                align-items: center;
+                padding: 0.75rem 0;
+                border-bottom: 1px solid rgba(255,255,255,0.05);
+            }}
+            .activity-item:last-child {{ border-bottom: none; }}
+            .activity-action {{
+                background: rgba(255,107,107,0.2);
+                color: #ff6b6b;
+                padding: 0.25rem 0.75rem;
+                border-radius: 20px;
+                font-size: 0.8rem;
+                font-weight: 500;
+                min-width: 80px;
+                text-align: center;
+            }}
+            .activity-action.comment {{ background: rgba(74,222,128,0.2); color: #4ade80; }}
+            .activity-action.upvote {{ background: rgba(96,165,250,0.2); color: #60a5fa; }}
+            .activity-action.error {{ background: rgba(248,113,113,0.3); color: #f87171; }}
+            .activity-details {{
+                flex: 1;
+                margin-left: 1rem;
+            }}
+            .activity-title {{ font-weight: 500; }}
+            .activity-time {{ color: #666; font-size: 0.85rem; }}
+            .activity-link {{
+                color: #60a5fa;
+                text-decoration: none;
+                font-size: 0.85rem;
+            }}
+            .activity-link:hover {{ text-decoration: underline; }}
+            .schedule {{
+                background: rgba(255,255,255,0.05);
+                border-radius: 12px;
+                padding: 1.5rem;
+                border: 1px solid rgba(255,255,255,0.1);
+            }}
+            .schedule h2 {{ margin-bottom: 1rem; font-size: 1.2rem; }}
+            .schedule-item {{
+                display: flex;
+                justify-content: space-between;
+                padding: 0.5rem 0;
+                border-bottom: 1px solid rgba(255,255,255,0.05);
+            }}
+            .schedule-item:last-child {{ border-bottom: none; }}
+            .topics {{
+                margin-top: 1rem;
+                padding-top: 1rem;
+                border-top: 1px solid rgba(255,255,255,0.1);
+            }}
+            .topics h3 {{ font-size: 0.9rem; color: #888; margin-bottom: 0.5rem; }}
+            .topic-item {{
+                background: rgba(255,255,255,0.05);
+                padding: 0.5rem 0.75rem;
+                border-radius: 6px;
+                margin-bottom: 0.5rem;
+                font-size: 0.9rem;
+            }}
+            .empty {{ color: #666; font-style: italic; }}
+            .refresh {{
+                text-align: center;
+                margin-top: 2rem;
+                color: #666;
+                font-size: 0.85rem;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🦞 Azoni-AI</h1>
+                <p>Autonomous Moltbook Agent</p>
+            </div>
+            
+            <div class="grid">
+                <div class="card">
+                    <h3>Moltbook</h3>
+                    <div class="value {moltbook_class}">{moltbook_status}</div>
+                </div>
+                <div class="card">
+                    <h3>Autonomous</h3>
+                    <div class="value {auto_class}">{auto_text}</div>
+                </div>
+                <div class="card">
+                    <h3>Posts Today</h3>
+                    <div class="value">{posts_today}</div>
+                </div>
+                <div class="card">
+                    <h3>Comments Today</h3>
+                    <div class="value">{comments_today}</div>
+                </div>
+            </div>
+            
+            <div class="activity">
+                <h2>📋 Recent Activity</h2>
+                {"".join(f'''
+                <div class="activity-item">
+                    <span class="activity-action {'error' if a['error'] else a['action']}">{a['action'].upper() if not a['error'] else 'ERROR'}</span>
+                    <div class="activity-details">
+                        <div class="activity-title">{a['title'] or a.get('error', 'No details')[:40] or 'Activity'}</div>
+                        <div class="activity-time">{a['date']} at {a['time']}</div>
+                    </div>
+                    {f'<a href="{a["link"]}" target="_blank" class="activity-link">View ↗</a>' if a['link'] else ''}
+                </div>
+                ''' for a in activities) or '<div class="empty">No activity yet</div>'}
+            </div>
+            
+            <div class="schedule">
+                <h2>⏰ Upcoming Jobs</h2>
+                {f'<div class="empty">Scheduler not running</div>' if not scheduler.running else ''}
+                {"".join(f'''
+                <div class="schedule-item">
+                    <span>{j['id']}</span>
+                    <span style="color: #4ade80;">{j['next']}</span>
+                </div>
+                ''' for j in next_jobs) if next_jobs else ''}
+                
+                <div class="topics">
+                    <h3>📝 Post Topics Queue ({len(topics)})</h3>
+                    {"".join(f'<div class="topic-item">{i+1}. {t[:60]}{"..." if len(t) > 60 else ""}</div>' for i, t in enumerate(topics[:5])) if topics else '<div class="empty">No topics queued - using random defaults</div>'}
+                </div>
+            </div>
+            
+            <div class="refresh">
+                Auto-refreshes every 60 seconds • <a href="/status" style="color: #60a5fa;">JSON API</a>
+            </div>
+        </div>
+        <script>
+            setTimeout(() => location.reload(), 60000);
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
 
 
 @app.get("/status")
