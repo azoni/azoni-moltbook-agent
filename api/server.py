@@ -935,7 +935,6 @@ class CommentRequest(BaseModel):
 
 class ConfigUpdate(BaseModel):
     autonomous_mode: Optional[bool] = None
-    heartbeat_interval_hours: Optional[int] = None
     max_posts_per_day: Optional[int] = None
     post_topics: Optional[List[str]] = None
     intervals: Optional[Dict] = None  # {"post": 45, "comment": 10, "reply": 8, "upvote": 15, "watcher": 5}
@@ -1170,6 +1169,27 @@ async def root():
                 topics_html += f'<div class="topic-item"><span class="topic-num">{i+1}</span>{topic_text}</div>'
         else:
             topics_html = '<div class="empty">No topics queued - agent will pick interesting topics from feed</div>'
+        
+        # Build interval controls HTML
+        current_intervals = get_intervals()
+        interval_labels = {
+            "post": {"icon": "📝", "name": "Post"},
+            "comment": {"icon": "💬", "name": "Comment"},
+            "reply": {"icon": "↩️", "name": "Reply"},
+            "upvote": {"icon": "👍", "name": "Upvote"},
+            "watcher": {"icon": "👀", "name": "Watcher"},
+        }
+        intervals_html = ""
+        for key, meta in interval_labels.items():
+            val = current_intervals.get(key, 0)
+            intervals_html += f'''
+                <div class="interval-row">
+                    <span class="interval-label">{meta["icon"]} {meta["name"]}</span>
+                    <div>
+                        <input type="number" class="interval-input" id="interval-{key}" value="{val}" min="0" max="999">
+                        <span class="interval-unit">min</span>
+                    </div>
+                </div>'''
         
         # Get job history
         job_history = []
@@ -1478,6 +1498,65 @@ async def root():
                 }}
                 .footer a {{ color: #60a5fa; text-decoration: none; }}
                 .footer a:hover {{ text-decoration: underline; }}
+                .interval-row {{
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
+                    padding: 0.6rem 0;
+                    border-bottom: 1px solid rgba(255,255,255,0.05);
+                }}
+                .interval-row:last-child {{ border-bottom: none; }}
+                .interval-label {{
+                    display: flex;
+                    align-items: center;
+                    gap: 0.5rem;
+                    font-size: 0.9rem;
+                }}
+                .interval-input {{
+                    width: 60px;
+                    background: rgba(255,255,255,0.1);
+                    border: 1px solid rgba(255,255,255,0.2);
+                    border-radius: 6px;
+                    color: #fff;
+                    padding: 0.3rem 0.5rem;
+                    text-align: center;
+                    font-size: 0.9rem;
+                }}
+                .interval-input:focus {{
+                    outline: none;
+                    border-color: #60a5fa;
+                }}
+                .interval-unit {{
+                    color: #666;
+                    font-size: 0.8rem;
+                    margin-left: 0.3rem;
+                }}
+                .btn {{
+                    background: linear-gradient(90deg, #ff6b6b, #ffa500);
+                    border: none;
+                    color: #fff;
+                    padding: 0.5rem 1.25rem;
+                    border-radius: 8px;
+                    cursor: pointer;
+                    font-size: 0.85rem;
+                    font-weight: 600;
+                    margin-top: 0.75rem;
+                    transition: opacity 0.2s;
+                }}
+                .btn:hover {{ opacity: 0.85; }}
+                .btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+                .btn-sm {{
+                    padding: 0.3rem 0.75rem;
+                    font-size: 0.8rem;
+                    margin-top: 0;
+                }}
+                .save-status {{
+                    color: #4ade80;
+                    font-size: 0.8rem;
+                    margin-left: 0.75rem;
+                    opacity: 0;
+                    transition: opacity 0.3s;
+                }}
                 .two-col {{
                     display: grid;
                     grid-template-columns: 1fr 1fr;
@@ -1533,11 +1612,21 @@ async def root():
                     </div>
                     
                     <div class="section">
-                        <h2>📝 Post Topics Queue</h2>
-                        {topics_html if topics else '<div class="empty">No topics queued - agent will pick interesting topics from feed</div>'}
-                        <div style="margin-top: 1rem; font-size: 0.8rem; color: #666;">
-                            {len(topics)} topic{"s" if len(topics) != 1 else ""} in queue
+                        <h2>⚙️ Job Intervals</h2>
+                        {intervals_html}
+                        <div style="display: flex; align-items: center; margin-top: 0.75rem;">
+                            <button class="btn" onclick="saveIntervals()">Save</button>
+                            <span class="save-status" id="save-status">✓ Saved</span>
                         </div>
+                        <div style="font-size: 0.75rem; color: #666; margin-top: 0.5rem;">Set to 0 to disable a job</div>
+                    </div>
+                </div>
+                
+                <div class="section">
+                    <h2>📝 Post Topics Queue</h2>
+                    {topics_html if topics else '<div class="empty">No topics queued - agent will pick interesting topics from feed</div>'}
+                    <div style="margin-top: 1rem; font-size: 0.8rem; color: #666;">
+                        {len(topics)} topic{"s" if len(topics) != 1 else ""} in queue
                     </div>
                 </div>
                 
@@ -1557,6 +1646,41 @@ async def root():
             </div>
             <script>
                 setTimeout(function() {{ location.reload(); }}, 60000);
+                
+                async function saveIntervals() {{
+                    const btn = document.querySelector('.btn');
+                    const status = document.getElementById('save-status');
+                    btn.disabled = true;
+                    btn.textContent = 'Saving...';
+                    
+                    const intervals = {{}};
+                    ['post', 'comment', 'reply', 'upvote', 'watcher'].forEach(key => {{
+                        const input = document.getElementById('interval-' + key);
+                        if (input) intervals[key] = parseInt(input.value) || 0;
+                    }});
+                    
+                    try {{
+                        const res = await fetch('/config', {{
+                            method: 'PATCH',
+                            headers: {{'Content-Type': 'application/json'}},
+                            body: JSON.stringify({{intervals}})
+                        }});
+                        const data = await res.json();
+                        if (data.success) {{
+                            status.style.opacity = '1';
+                            status.textContent = '✓ Saved & rescheduled';
+                            setTimeout(() => {{ status.style.opacity = '0'; }}, 3000);
+                        }}
+                    }} catch(e) {{
+                        status.style.opacity = '1';
+                        status.style.color = '#f87171';
+                        status.textContent = '✗ Failed';
+                        setTimeout(() => {{ status.style.opacity = '0'; status.style.color = '#4ade80'; }}, 3000);
+                    }}
+                    
+                    btn.disabled = false;
+                    btn.textContent = 'Save';
+                }}
             </script>
         </body>
         </html>
@@ -1630,7 +1754,6 @@ async def get_status():
         "last_run_at": state_data.get("last_run_at"),
         "last_activity": state_data.get("last_activity"),
         "posts_today": len(posts_today),
-        "heartbeat_interval_hours": config_data.get("heartbeat_interval_hours", 4),
         "scheduler_running": scheduler.running,
         "scheduler_jobs": scheduler_jobs
     }
@@ -1820,8 +1943,6 @@ async def update_config(request: ConfigUpdate):
     update_data = {}
     if request.autonomous_mode is not None:
         update_data["autonomous_mode"] = request.autonomous_mode
-    if request.heartbeat_interval_hours is not None:
-        update_data["heartbeat_interval_hours"] = request.heartbeat_interval_hours
     if request.max_posts_per_day is not None:
         update_data["max_posts_per_day"] = request.max_posts_per_day
     if request.post_topics is not None:
@@ -1850,7 +1971,6 @@ async def get_config():
     
     return {
         "autonomous_mode": config_data.get("autonomous_mode", False),
-        "heartbeat_interval_hours": config_data.get("heartbeat_interval_hours", 4),
         "max_posts_per_day": config_data.get("max_posts_per_day", 6),
         "post_topics": config_data.get("post_topics", []),
         "intervals": {**DEFAULT_INTERVALS, **config_data.get("intervals", {})}

@@ -22,7 +22,6 @@ class Settings(BaseSettings):
     
     # Agent Settings
     autonomous_mode: bool = False
-    heartbeat_interval_hours: int = 4
     max_posts_per_day: int = 6
     
     # Personality
