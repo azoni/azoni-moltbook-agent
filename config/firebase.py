@@ -61,3 +61,4 @@ def get_firestore():
 MOLTBOOK_CONFIG = "moltbook_config"
 MOLTBOOK_ACTIVITY = "moltbook_activity"
 MOLTBOOK_STATE = "moltbook_state"
+MOLTBOOK_JOB_HISTORY = "moltbook_job_history"

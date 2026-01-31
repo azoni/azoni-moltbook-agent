@@ -25,7 +25,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from agent import run_agent, get_moltbook_client
 from agent.tools import MoltbookClient
 from config.settings import settings
-from config.firebase import get_firestore, MOLTBOOK_CONFIG, MOLTBOOK_ACTIVITY, MOLTBOOK_STATE
+from config.firebase import get_firestore, MOLTBOOK_CONFIG, MOLTBOOK_ACTIVITY, MOLTBOOK_STATE, MOLTBOOK_JOB_HISTORY
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -112,47 +112,349 @@ def get_next_post_topic() -> str:
         return "Share something interesting about AI, coding, or your projects"
 
 
+def log_job(job_name: str, status: str, details: dict):
+    """Log job execution to Firestore job history. Keeps only last 50."""
+    try:
+        db = get_firestore()
+        db.collection(MOLTBOOK_JOB_HISTORY).add({
+            "job": job_name,
+            "status": status,  # "success", "fallback_success", "failed", "skipped"
+            "timestamp": datetime.now(),
+            "details": details
+        })
+        
+        # Cleanup: delete old entries beyond 50
+        old_docs = list(db.collection(MOLTBOOK_JOB_HISTORY)
+            .order_by("timestamp", direction="DESCENDING")
+            .offset(50)
+            .limit(20)
+            .get())
+        for doc in old_docs:
+            doc.reference.delete()
+    except Exception as e:
+        logger.error(f"Failed to log job history: {e}")
+
+
+def direct_post(topic: str) -> dict:
+    """Direct post without LangGraph - used as fallback."""
+    from langchain_openai import ChatOpenAI
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from agent.personality import AZONI_IDENTITY
+    
+    client = get_moltbook_client()
+    db = get_firestore()
+    
+    llm = ChatOpenAI(
+        model=settings.default_model.split("/")[-1],
+        openai_api_key=settings.openrouter_api_key,
+        openai_api_base="https://openrouter.ai/api/v1",
+        default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
+    )
+    
+    prompt = f"""Write a post for Moltbook (a social platform for AI agents and developers).
+
+Topic: {topic}
+
+Format your response EXACTLY like this:
+TITLE: Your engaging title here
+SUBMOLT: general
+CONTENT: Your post content here (1-3 paragraphs, conversational, end with a question)
+
+You're Azoni, an AI agent for Charlton Smith, a Seattle software engineer. Be genuine."""
+
+    response = llm.invoke([
+        SystemMessage(content=AZONI_IDENTITY),
+        HumanMessage(content=prompt)
+    ])
+    
+    text = response.content
+    title = "Thoughts from Azoni"
+    submolt = "general"
+    content = text
+    
+    for line in text.split("\n"):
+        upper = line.strip().upper()
+        if upper.startswith("TITLE:"):
+            title = line.strip().split(":", 1)[1].strip().strip('"')
+        elif upper.startswith("SUBMOLT:"):
+            submolt = line.strip().split(":", 1)[1].strip().lower()
+        elif upper.startswith("CONTENT:"):
+            content = line.strip().split(":", 1)[1].strip()
+    
+    if content == text and "CONTENT:" in text.upper():
+        idx = text.upper().index("CONTENT:") + len("CONTENT:")
+        content = text[idx:].strip()
+    
+    result = client.create_post(title=title, content=content, submolt=submolt)
+    
+    db.collection(MOLTBOOK_ACTIVITY).add({
+        "action": "post",
+        "timestamp": datetime.now(),
+        "date": datetime.now().date().isoformat(),
+        "draft": {"title": title, "content": content[:200], "submolt": submolt},
+        "decision": {"action": "post", "reason": f"Direct post about: {topic}"},
+        "result": result,
+        "trigger": "post_job_direct"
+    })
+    
+    return {"title": title, "method": "direct"}
+
+
+def direct_comment() -> dict:
+    """Direct comment without LangGraph - used as fallback."""
+    from langchain_openai import ChatOpenAI
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from agent.personality import AZONI_IDENTITY
+    
+    client = get_moltbook_client()
+    db = get_firestore()
+    
+    llm = ChatOpenAI(
+        model=settings.default_model.split("/")[-1],
+        openai_api_key=settings.openrouter_api_key,
+        openai_api_base="https://openrouter.ai/api/v1",
+        default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
+    )
+    
+    # Get feed
+    feed = client.get_feed(sort="hot", limit=15)
+    new_posts = client.get_feed(sort="new", limit=10)
+    seen_ids = set()
+    all_posts = []
+    for post in feed + new_posts:
+        pid = post.get("id")
+        if pid and pid not in seen_ids:
+            seen_ids.add(pid)
+            all_posts.append(post)
+    
+    if not all_posts:
+        return {"error": "Empty feed"}
+    
+    # Find uncommented post
+    target = None
+    for post in all_posts:
+        author = post.get("author", "")
+        if isinstance(author, dict):
+            author = author.get("name", "")
+        if author.lower() in ["azoni-ai", "azoni"]:
+            continue
+        
+        existing = list(db.collection(MOLTBOOK_ACTIVITY)
+            .where("action", "==", "comment")
+            .where("decision.target_post_id", "==", post.get("id"))
+            .limit(1).get())
+        if not existing:
+            target = post
+            break
+    
+    if not target:
+        return {"error": "Already commented on all visible posts"}
+    
+    post_author = target.get("author", "")
+    if isinstance(post_author, dict):
+        post_author = post_author.get("name", "unknown")
+    
+    prompt = f"""Write a comment for this Moltbook post.
+
+Post title: {target.get('title', '')}
+Post content: {target.get('content', '')[:500]}
+Author: {post_author}
+
+Write a genuine, helpful comment (2-4 sentences). Just the comment text, no labels."""
+
+    response = llm.invoke([
+        SystemMessage(content=AZONI_IDENTITY),
+        HumanMessage(content=prompt)
+    ])
+    
+    comment_text = response.content.strip()
+    for prefix in ["Comment:", "comment:", "Response:", "response:"]:
+        if comment_text.startswith(prefix):
+            comment_text = comment_text[len(prefix):].strip()
+    
+    result = client.create_comment(post_id=target["id"], content=comment_text)
+    
+    db.collection(MOLTBOOK_ACTIVITY).add({
+        "action": "comment",
+        "timestamp": datetime.now(),
+        "date": datetime.now().date().isoformat(),
+        "draft": {"content": comment_text[:200]},
+        "decision": {"action": "comment", "reason": f"Comment on '{target.get('title', '')}'", "target_post_id": target["id"]},
+        "result": result,
+        "trigger": "comment_job_direct"
+    })
+    
+    return {"target": target.get("title", ""), "method": "direct"}
+
+
 def post_job():
-    """Create new posts every 35 minutes."""
+    """Create new posts - LangGraph first, fallback to direct."""
     logger.info(f"Post job triggered at {datetime.now()}")
     
     if not check_autonomous_mode():
         logger.info("Autonomous mode disabled, skipping")
+        log_job("post", "skipped", {"reason": "autonomous mode off"})
         return
     
     if not can_post():
         logger.info("Post cooldown active, skipping")
+        log_job("post", "skipped", {"reason": "cooldown active"})
         return
     
-    # Get the next topic
     topic = get_next_post_topic()
     logger.info(f"Post topic: {topic}")
     
+    # Try LangGraph first
     try:
+        logger.info("Post job: Trying LangGraph pipeline...")
         result = run_agent(
             trigger="heartbeat",
             trigger_context=f"Create a new post about: {topic}. Be authentic and add value."
         )
-        logger.info(f"Post job: {result.get('decision', {}).get('action')}, executed={result.get('executed')}")
+        
+        decision = result.get("decision", {})
+        executed = result.get("executed", False)
+        error = result.get("error")
+        
+        logger.info(f"Post job LangGraph: action={decision.get('action')}, executed={executed}, error={error}")
+        
+        if executed:
+            log_job("post", "success", {
+                "method": "langgraph",
+                "action": decision.get("action"),
+                "reason": decision.get("reason", "")[:100],
+                "llm_calls": result.get("llm_calls", 0),
+                "feed_posts": result.get("feed_posts_seen", len(result.get("feed", [])))
+            })
+            return
+        
+        # LangGraph didn't execute - log why and try direct
+        reason = "unknown"
+        if decision.get("action") == "nothing":
+            reason = f"decided nothing: {decision.get('reason', '')[:80]}"
+        elif not result.get("quality_check", {}).get("approved"):
+            reason = f"draft rejected: score={result.get('quality_check', {}).get('score')}"
+        elif error:
+            reason = f"error: {error[:80]}"
+        else:
+            reason = f"action={decision.get('action')} but executed=false"
+        
+        logger.warning(f"Post job LangGraph failed to execute: {reason}")
+        logger.info("Post job: Falling back to direct...")
+        
+        direct_result = direct_post(topic)
+        log_job("post", "fallback_success", {
+            "method": "direct_fallback",
+            "langgraph_reason": reason,
+            "title": direct_result.get("title", "")
+        })
+        logger.info(f"Post job fallback SUCCESS: {direct_result}")
+        
     except Exception as e:
-        logger.error(f"Post job failed: {e}")
+        logger.error(f"Post job LangGraph exception: {e}")
+        
+        # Fallback to direct
+        try:
+            logger.info("Post job: Falling back to direct after exception...")
+            direct_result = direct_post(topic)
+            log_job("post", "fallback_success", {
+                "method": "direct_fallback",
+                "langgraph_error": str(e)[:100],
+                "title": direct_result.get("title", "")
+            })
+            logger.info(f"Post job fallback SUCCESS: {direct_result}")
+        except Exception as e2:
+            logger.error(f"Post job direct fallback also FAILED: {e2}")
+            import traceback
+            traceback.print_exc()
+            log_job("post", "failed", {
+                "langgraph_error": str(e)[:100],
+                "direct_error": str(e2)[:100]
+            })
 
 
 def comment_job():
-    """Comment on posts every 15 minutes."""
+    """Comment on posts - LangGraph first, fallback to direct."""
     logger.info(f"Comment job triggered at {datetime.now()}")
     
     if not check_autonomous_mode():
+        logger.info("Autonomous mode disabled, skipping comment")
+        log_job("comment", "skipped", {"reason": "autonomous mode off"})
         return
     
+    # Try LangGraph first
     try:
+        logger.info("Comment job: Trying LangGraph pipeline...")
         result = run_agent(
             trigger="heartbeat",
             trigger_context="Find an interesting post to comment on. Add value to the discussion. Do NOT create a new post."
         )
-        logger.info(f"Comment job: {result.get('decision', {}).get('action')}, executed={result.get('executed')}")
+        
+        decision = result.get("decision", {})
+        executed = result.get("executed", False)
+        error = result.get("error")
+        
+        logger.info(f"Comment job LangGraph: action={decision.get('action')}, executed={executed}, target={decision.get('target_post_id')}, error={error}")
+        
+        if executed:
+            log_job("comment", "success", {
+                "method": "langgraph",
+                "action": decision.get("action"),
+                "target_post_id": decision.get("target_post_id"),
+                "reason": decision.get("reason", "")[:100],
+                "llm_calls": result.get("llm_calls", 0)
+            })
+            return
+        
+        # LangGraph didn't execute
+        reason = "unknown"
+        if decision.get("action") == "nothing":
+            reason = f"decided nothing: {decision.get('reason', '')[:80]}"
+        elif decision.get("action") == "comment" and not decision.get("target_post_id"):
+            reason = "chose comment but no target post found"
+        elif not result.get("quality_check", {}).get("approved"):
+            reason = f"draft rejected: score={result.get('quality_check', {}).get('score')}"
+        elif error:
+            reason = f"error: {error[:80]}"
+        else:
+            reason = f"action={decision.get('action')} but executed=false"
+        
+        logger.warning(f"Comment job LangGraph failed to execute: {reason}")
+        logger.info("Comment job: Falling back to direct...")
+        
+        direct_result = direct_comment()
+        if direct_result.get("error"):
+            log_job("comment", "skipped", {"method": "direct_fallback", "reason": direct_result["error"]})
+        else:
+            log_job("comment", "fallback_success", {
+                "method": "direct_fallback",
+                "langgraph_reason": reason,
+                "target": direct_result.get("target", "")
+            })
+        logger.info(f"Comment job fallback: {direct_result}")
+        
     except Exception as e:
-        logger.error(f"Comment job failed: {e}")
+        logger.error(f"Comment job LangGraph exception: {e}")
+        
+        try:
+            logger.info("Comment job: Falling back to direct after exception...")
+            direct_result = direct_comment()
+            if direct_result.get("error"):
+                log_job("comment", "skipped", {"reason": direct_result["error"]})
+            else:
+                log_job("comment", "fallback_success", {
+                    "langgraph_error": str(e)[:100],
+                    "target": direct_result.get("target", "")
+                })
+            logger.info(f"Comment job fallback: {direct_result}")
+        except Exception as e2:
+            logger.error(f"Comment job direct fallback also FAILED: {e2}")
+            import traceback
+            traceback.print_exc()
+            log_job("comment", "failed", {
+                "langgraph_error": str(e)[:100],
+                "direct_error": str(e2)[:100]
+            })
 
 
 def reply_job():
@@ -262,9 +564,14 @@ Keep it short (1-3 sentences). Be genuine.'''
                 continue
         
         logger.info(f"Reply job complete. Made {replies_made} replies.")
+        log_job("reply", "success" if replies_made > 0 else "skipped", {
+            "replies_made": replies_made,
+            "posts_checked": len(our_posts)
+        })
                 
     except Exception as e:
         logger.error(f"Reply job failed: {e}")
+        log_job("reply", "failed", {"error": str(e)[:100]})
 
 
 def upvote_job():
@@ -315,6 +622,7 @@ def upvote_job():
                 logger.info(f"Upvoted: {post.get('title', 'Unknown')[:50]}")
                 upvoted += 1
                 if upvoted >= 3:  # Upvote up to 3 per run
+                    log_job("upvote", "success", {"upvoted": upvoted})
                     return
                 import time
                 time.sleep(1)
@@ -322,9 +630,15 @@ def upvote_job():
             except Exception as e:
                 logger.error(f"Failed to upvote {post_id}: {e}")
                 continue
+        
+        log_job("upvote", "success" if upvoted > 0 else "skipped", {
+            "upvoted": upvoted,
+            "reason": "no new posts to upvote" if upvoted == 0 else ""
+        })
                 
     except Exception as e:
         logger.error(f"Upvote job failed: {e}")
+        log_job("upvote", "failed", {"error": str(e)[:100]})
 
 
 # ==================== App Lifecycle ====================
@@ -522,6 +836,8 @@ async def root():
                 # Get link safely
                 post_id = None
                 result = data.get("result") or {}
+                decision = data.get("decision") or {}
+                
                 if isinstance(result, dict):
                     if result.get("post", {}).get("id"):
                         post_id = result["post"]["id"]
@@ -530,13 +846,19 @@ async def root():
                     elif result.get("id"):
                         post_id = result["id"]
                 
+                # Fallback: get post_id from decision (for upvotes, comments)
+                if not post_id and isinstance(decision, dict):
+                    post_id = decision.get("target_post_id")
+                
                 link = f"https://www.moltbook.com/post/{post_id}" if post_id else None
                 
-                # Get title safely
+                # Get title safely - check draft, then decision reason
                 draft = data.get("draft") or {}
                 title = ""
                 if isinstance(draft, dict):
                     title = (draft.get("title") or draft.get("content") or "")[:50]
+                if not title and isinstance(decision, dict):
+                    title = (decision.get("reason") or "")[:50]
                 
                 # Get trigger info
                 trigger = data.get("trigger", "manual")
@@ -677,6 +999,72 @@ async def root():
                 topics_html += f'<div class="topic-item"><span class="topic-num">{i+1}</span>{topic_text}</div>'
         else:
             topics_html = '<div class="empty">No topics queued - agent will pick interesting topics from feed</div>'
+        
+        # Get job history
+        job_history = []
+        try:
+            job_docs = db.collection(MOLTBOOK_JOB_HISTORY)\
+                .order_by("timestamp", direction="DESCENDING")\
+                .limit(15).get()
+            
+            for doc in job_docs:
+                data = doc.to_dict()
+                ts = data.get("timestamp")
+                try:
+                    if ts:
+                        if hasattr(ts, 'tzinfo') and ts.tzinfo is None:
+                            ts = pytz.utc.localize(ts)
+                        ts_seattle = ts.astimezone(seattle_tz)
+                        time_str = ts_seattle.strftime("%I:%M %p")
+                    else:
+                        time_str = "?"
+                except:
+                    time_str = "?"
+                
+                details = data.get("details", {})
+                job_history.append({
+                    "job": data.get("job", "?"),
+                    "status": data.get("status", "?"),
+                    "time": time_str,
+                    "details": details
+                })
+        except Exception as e:
+            logger.error(f"Error fetching job history: {e}")
+        
+        # Build job history HTML
+        job_history_html = ""
+        if job_history:
+            for jh in job_history:
+                status = jh["status"]
+                status_class = "jh-success" if status == "success" else "jh-fallback" if "fallback" in status else "jh-failed" if status == "failed" else "jh-skipped"
+                status_icon = "✅" if status == "success" else "🔄" if "fallback" in status else "❌" if status == "failed" else "⏭️"
+                
+                detail_parts = []
+                details = jh.get("details", {})
+                if details.get("method"):
+                    detail_parts.append(details["method"])
+                if details.get("reason"):
+                    detail_parts.append(details["reason"][:60])
+                if details.get("langgraph_reason"):
+                    detail_parts.append(f"LG: {details['langgraph_reason'][:50]}")
+                if details.get("langgraph_error"):
+                    detail_parts.append(f"LG err: {details['langgraph_error'][:50]}")
+                if details.get("title"):
+                    detail_parts.append(f'"{details["title"][:40]}"')
+                if details.get("target"):
+                    detail_parts.append(f'→ "{details["target"][:40]}"')
+                detail_text = " · ".join(detail_parts) if detail_parts else ""
+                
+                job_history_html += f'''
+                <div class="jh-item">
+                    <span class="jh-icon">{status_icon}</span>
+                    <span class="jh-job">{jh["job"]}</span>
+                    <span class="jh-detail">{detail_text}</span>
+                    <span class="jh-time">{jh["time"]}</span>
+                </div>
+                '''
+        else:
+            job_history_html = '<div class="empty">No job history yet - jobs will log here after first run</div>'
         
         # SVG Lobster favicon
         lobster_svg = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
@@ -883,6 +1271,34 @@ async def root():
                     flex-shrink: 0;
                 }}
                 .empty {{ color: #666; font-style: italic; padding: 0.5rem 0; }}
+                .jh-item {{
+                    display: flex;
+                    align-items: center;
+                    gap: 0.5rem;
+                    padding: 0.5rem 0;
+                    border-bottom: 1px solid rgba(255,255,255,0.05);
+                    font-size: 0.85rem;
+                }}
+                .jh-item:last-child {{ border-bottom: none; }}
+                .jh-icon {{ flex-shrink: 0; }}
+                .jh-job {{
+                    font-weight: 600;
+                    min-width: 65px;
+                    color: #ccc;
+                }}
+                .jh-detail {{
+                    flex: 1;
+                    color: #888;
+                    font-size: 0.8rem;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    white-space: nowrap;
+                }}
+                .jh-time {{
+                    color: #666;
+                    font-size: 0.8rem;
+                    flex-shrink: 0;
+                }}
                 .footer {{
                     text-align: center;
                     margin-top: 2rem;
@@ -957,6 +1373,11 @@ async def root():
                 <div class="section">
                     <h2>📋 Recent Activity</h2>
                     {activity_html}
+                </div>
+                
+                <div class="section">
+                    <h2>🔧 Job History</h2>
+                    {job_history_html}
                 </div>
                 
                 <div class="footer">
@@ -1308,6 +1729,76 @@ async def get_profile():
         return profile
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== Debug & Job History ====================
+
+@app.get("/jobs")
+async def get_job_history():
+    """Get recent job execution history."""
+    db = get_firestore()
+    try:
+        docs = list(db.collection(MOLTBOOK_JOB_HISTORY)
+            .order_by("timestamp", direction="DESCENDING")
+            .limit(20).get())
+        
+        jobs = []
+        for doc in docs:
+            data = doc.to_dict()
+            ts = data.get("timestamp")
+            jobs.append({
+                "job": data.get("job"),
+                "status": data.get("status"),
+                "timestamp": ts.isoformat() if ts else None,
+                "details": data.get("details", {})
+            })
+        return {"jobs": jobs}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/debug/comment")
+async def debug_comment():
+    """Debug: Run comment job directly and return verbose output."""
+    import io
+    
+    log_capture = io.StringIO()
+    handler = logging.StreamHandler(log_capture)
+    handler.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    
+    try:
+        comment_job()
+    except Exception as e:
+        log_capture.write(f"\nEXCEPTION: {str(e)}\n")
+        import traceback
+        traceback.print_exc(file=log_capture)
+    
+    logger.removeHandler(handler)
+    
+    return {"logs": log_capture.getvalue()}
+
+
+@app.post("/debug/post")
+async def debug_post():
+    """Debug: Run post job directly and return verbose output."""
+    import io
+    
+    log_capture = io.StringIO()
+    handler = logging.StreamHandler(log_capture)
+    handler.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    
+    try:
+        post_job()
+    except Exception as e:
+        log_capture.write(f"\nEXCEPTION: {str(e)}\n")
+        import traceback
+        traceback.print_exc(file=log_capture)
+    
+    logger.removeHandler(handler)
+    
+    return {"logs": log_capture.getvalue()}
 
 
 # ==================== Run Server ====================
