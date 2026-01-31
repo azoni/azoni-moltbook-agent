@@ -391,6 +391,10 @@ class ConfigUpdate(BaseModel):
 async def root():
     """Beautiful status dashboard."""
     try:
+        import pytz
+        seattle_tz = pytz.timezone('America/Los_Angeles')
+        now_seattle = datetime.now(seattle_tz)
+        
         db = get_firestore()
         
         # Get config (with fallback)
@@ -403,6 +407,7 @@ async def root():
         # Check Moltbook connection
         moltbook_status = "Not connected"
         moltbook_class = "status-offline"
+        moltbook_username = ""
         if settings.moltbook_api_key:
             try:
                 client = get_moltbook_client()
@@ -410,6 +415,7 @@ async def root():
                 if status_response.get("status") == "claimed":
                     moltbook_status = "Connected"
                     moltbook_class = "status-online"
+                    moltbook_username = status_response.get("agent", {}).get("name", "Azoni-AI")
                 else:
                     moltbook_status = status_response.get("status", "Unknown")
             except Exception as e:
@@ -426,8 +432,16 @@ async def root():
                 data = doc.to_dict()
                 ts = data.get("timestamp")
                 try:
-                    time_str = ts.strftime("%I:%M %p") if ts else "Unknown"
-                    date_str = ts.strftime("%b %d") if ts else ""
+                    # Convert to Seattle time
+                    if ts:
+                        if hasattr(ts, 'tzinfo') and ts.tzinfo is None:
+                            ts = pytz.utc.localize(ts)
+                        ts_seattle = ts.astimezone(seattle_tz)
+                        time_str = ts_seattle.strftime("%I:%M %p")
+                        date_str = ts_seattle.strftime("%b %d")
+                    else:
+                        time_str = "Unknown"
+                        date_str = ""
                 except:
                     time_str = "Unknown"
                     date_str = ""
@@ -449,7 +463,10 @@ async def root():
                 draft = data.get("draft") or {}
                 title = ""
                 if isinstance(draft, dict):
-                    title = (draft.get("title") or draft.get("content") or "")[:40]
+                    title = (draft.get("title") or draft.get("content") or "")[:50]
+                
+                # Get trigger info
+                trigger = data.get("trigger", "manual")
                 
                 activities.append({
                     "action": data.get("action", "unknown"),
@@ -457,7 +474,8 @@ async def root():
                     "date": date_str,
                     "title": title,
                     "error": data.get("error"),
-                    "link": link
+                    "link": link,
+                    "trigger": trigger
                 })
         except Exception as e:
             logger.error(f"Error fetching activity: {e}")
@@ -465,6 +483,7 @@ async def root():
         # Count today's activity (with fallback)
         posts_today = 0
         comments_today = 0
+        upvotes_today = 0
         try:
             today = datetime.now().date().isoformat()
             posts_today = len(list(db.collection(MOLTBOOK_ACTIVITY)
@@ -475,18 +494,44 @@ async def root():
                 .where("action", "==", "comment")
                 .where("date", "==", today)
                 .limit(50).get()))
+            upvotes_today = len(list(db.collection(MOLTBOOK_ACTIVITY)
+                .where("action", "==", "upvote")
+                .where("date", "==", today)
+                .limit(50).get()))
         except:
             pass
         
-        # Scheduler info
+        # Scheduler info with more details
         scheduler_status = "Running" if scheduler.running else "Stopped"
+        scheduler_class = "status-online" if scheduler.running else "status-offline"
+        
+        job_details = {
+            "post": {"interval": "45 min", "desc": "Creates new posts on interesting topics", "icon": "📝"},
+            "comment": {"interval": "20 min", "desc": "Comments on trending posts", "icon": "💬"},
+            "reply": {"interval": "10 min", "desc": "Replies to comments on your posts", "icon": "↩️"},
+            "upvote": {"interval": "15 min", "desc": "Upvotes quality content", "icon": "👍"},
+        }
+        
         next_jobs = []
         if scheduler.running:
             for job in scheduler.get_jobs():
                 if job.next_run_time:
+                    # Convert to Seattle time
+                    next_seattle = job.next_run_time.astimezone(seattle_tz)
+                    job_name = job.id.replace("_job", "")
+                    details = job_details.get(job_name, {"interval": "?", "desc": "Scheduled task", "icon": "⚡"})
+                    
+                    # Calculate time until
+                    time_until = job.next_run_time - datetime.now(pytz.utc)
+                    mins_until = int(time_until.total_seconds() / 60)
+                    
                     next_jobs.append({
-                        "id": job.id.replace("_job", "").title(),
-                        "next": job.next_run_time.strftime("%I:%M %p")
+                        "id": job_name.title(),
+                        "next": next_seattle.strftime("%I:%M %p"),
+                        "until": f"{mins_until}m" if mins_until < 60 else f"{mins_until//60}h {mins_until%60}m",
+                        "interval": details["interval"],
+                        "desc": details["desc"],
+                        "icon": details["icon"]
                     })
         
         # Autonomous mode
@@ -497,6 +542,10 @@ async def root():
         # Topics queue
         topics = config_data.get("post_topics", [])
         
+        # Current time in Seattle
+        current_time = now_seattle.strftime("%I:%M %p PST")
+        current_date = now_seattle.strftime("%A, %B %d")
+        
         # Build activity HTML
         activity_html = ""
         if activities:
@@ -505,41 +554,75 @@ async def root():
                 action_text = "ERROR" if a.get("error") else a["action"].upper()
                 title_text = a.get("title") or (a.get("error", "")[:40] if a.get("error") else "Activity")
                 link_html = f'<a href="{a["link"]}" target="_blank" class="activity-link">View ↗</a>' if a.get("link") else ""
+                trigger_badge = f'<span class="trigger-badge">{a.get("trigger", "manual")}</span>'
                 
                 activity_html += f'''
                 <div class="activity-item">
                     <span class="activity-action {action_class}">{action_text}</span>
                     <div class="activity-details">
                         <div class="activity-title">{title_text}</div>
-                        <div class="activity-time">{a["date"]} at {a["time"]}</div>
+                        <div class="activity-meta">
+                            <span class="activity-time">{a["date"]} at {a["time"]}</span>
+                            {trigger_badge}
+                        </div>
                     </div>
                     {link_html}
                 </div>
                 '''
         else:
-            activity_html = '<div class="empty">No activity yet</div>'
+            activity_html = '<div class="empty">No activity yet. Enable autonomous mode or trigger manually.</div>'
         
-        # Build schedule HTML
+        # Build schedule HTML with expanded details
         schedule_html = ""
         if not scheduler.running:
-            schedule_html = '<div class="empty">Scheduler not running</div>'
+            schedule_html = '<div class="empty">Scheduler not running - server may have just started</div>'
         elif next_jobs:
             for j in next_jobs:
                 schedule_html += f'''
-                <div class="schedule-item">
-                    <span>{j["id"]}</span>
-                    <span style="color: #4ade80;">{j["next"]}</span>
+                <div class="job-card">
+                    <div class="job-header">
+                        <span class="job-icon">{j["icon"]}</span>
+                        <span class="job-name">{j["id"]}</span>
+                        <span class="job-interval">every {j["interval"]}</span>
+                    </div>
+                    <div class="job-desc">{j["desc"]}</div>
+                    <div class="job-next">
+                        <span>Next run:</span>
+                        <span class="job-time">{j["next"]}</span>
+                        <span class="job-until">({j["until"]})</span>
+                    </div>
                 </div>
                 '''
+        else:
+            schedule_html = '<div class="empty">No jobs scheduled</div>'
         
         # Build topics HTML
         topics_html = ""
         if topics:
             for i, t in enumerate(topics[:5]):
-                topic_text = t[:60] + ("..." if len(t) > 60 else "")
-                topics_html += f'<div class="topic-item">{i+1}. {topic_text}</div>'
+                topic_text = t[:70] + ("..." if len(t) > 70 else "")
+                topics_html += f'<div class="topic-item"><span class="topic-num">{i+1}</span>{topic_text}</div>'
         else:
-            topics_html = '<div class="empty">No topics queued - using random defaults</div>'
+            topics_html = '<div class="empty">No topics queued - agent will pick interesting topics from feed</div>'
+        
+        # SVG Lobster favicon
+        lobster_svg = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+            <defs><linearGradient id="lg" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" style="stop-color:#ff6b6b"/><stop offset="100%" style="stop-color:#ee5a5a"/>
+            </linearGradient></defs>
+            <ellipse cx="32" cy="38" rx="14" ry="18" fill="url(#lg)"/>
+            <ellipse cx="32" cy="22" rx="10" ry="8" fill="url(#lg)"/>
+            <circle cx="28" cy="20" r="2" fill="#1a1a2e"/><circle cx="36" cy="20" r="2" fill="#1a1a2e"/>
+            <path d="M22 22 Q14 14 8 18" stroke="#ff6b6b" stroke-width="3" fill="none" stroke-linecap="round"/>
+            <path d="M42 22 Q50 14 56 18" stroke="#ff6b6b" stroke-width="3" fill="none" stroke-linecap="round"/>
+            <path d="M18 36 Q8 32 4 38 Q8 36 12 40" stroke="#ff6b6b" stroke-width="4" fill="none" stroke-linecap="round"/>
+            <path d="M46 36 Q56 32 60 38 Q56 36 52 40" stroke="#ff6b6b" stroke-width="4" fill="none" stroke-linecap="round"/>
+            <ellipse cx="6" cy="40" rx="4" ry="6" fill="url(#lg)"/>
+            <ellipse cx="58" cy="40" rx="4" ry="6" fill="url(#lg)"/>
+            <path d="M26 56 Q28 62 32 58 Q36 62 38 56" stroke="#ff6b6b" stroke-width="2" fill="none"/>
+        </svg>'''
+        
+        favicon_base64 = "data:image/svg+xml;base64," + __import__('base64').b64encode(lobster_svg.encode()).decode()
         
         html = f"""
         <!DOCTYPE html>
@@ -547,6 +630,7 @@ async def root():
         <head>
             <title>Azoni-AI | Moltbook Agent</title>
             <meta name="viewport" content="width=device-width, initial-scale=1">
+            <link rel="icon" type="image/svg+xml" href="{favicon_base64}">
             <style>
                 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
                 body {{
@@ -556,7 +640,7 @@ async def root():
                     color: #e0e0e0;
                     padding: 2rem;
                 }}
-                .container {{ max-width: 900px; margin: 0 auto; }}
+                .container {{ max-width: 1000px; margin: 0 auto; }}
                 .header {{
                     text-align: center;
                     margin-bottom: 2rem;
@@ -565,29 +649,38 @@ async def root():
                     border-radius: 16px;
                     border: 1px solid rgba(255,255,255,0.1);
                 }}
+                .header-logo {{
+                    width: 64px;
+                    height: 64px;
+                    margin-bottom: 1rem;
+                }}
                 .header h1 {{
                     font-size: 2.5rem;
                     background: linear-gradient(90deg, #ff6b6b, #ffa500);
                     -webkit-background-clip: text;
                     -webkit-text-fill-color: transparent;
                     background-clip: text;
-                    margin-bottom: 0.5rem;
+                    margin-bottom: 0.25rem;
                 }}
-                .header p {{ color: #888; }}
+                .header .subtitle {{ color: #888; margin-bottom: 0.5rem; }}
+                .header .time {{ color: #4ade80; font-size: 0.9rem; }}
+                .header .date {{ color: #666; font-size: 0.85rem; }}
+                .header .username {{ color: #60a5fa; font-size: 0.9rem; margin-top: 0.5rem; }}
                 .grid {{
                     display: grid;
-                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
                     gap: 1rem;
                     margin-bottom: 2rem;
                 }}
                 .card {{
                     background: rgba(255,255,255,0.05);
                     border-radius: 12px;
-                    padding: 1.5rem;
+                    padding: 1.25rem;
                     border: 1px solid rgba(255,255,255,0.1);
+                    text-align: center;
                 }}
                 .card h3 {{
-                    font-size: 0.85rem;
+                    font-size: 0.75rem;
                     color: #888;
                     text-transform: uppercase;
                     letter-spacing: 1px;
@@ -599,16 +692,19 @@ async def root():
                 }}
                 .status-online {{ color: #4ade80; }}
                 .status-offline {{ color: #f87171; }}
-                .activity {{
+                .section {{
                     background: rgba(255,255,255,0.05);
                     border-radius: 12px;
                     padding: 1.5rem;
                     border: 1px solid rgba(255,255,255,0.1);
-                    margin-bottom: 2rem;
+                    margin-bottom: 1.5rem;
                 }}
-                .activity h2 {{
+                .section h2 {{
                     margin-bottom: 1rem;
-                    font-size: 1.2rem;
+                    font-size: 1.1rem;
+                    display: flex;
+                    align-items: center;
+                    gap: 0.5rem;
                 }}
                 .activity-item {{
                     display: flex;
@@ -622,68 +718,122 @@ async def root():
                     color: #ff6b6b;
                     padding: 0.25rem 0.75rem;
                     border-radius: 20px;
-                    font-size: 0.8rem;
-                    font-weight: 500;
-                    min-width: 80px;
+                    font-size: 0.75rem;
+                    font-weight: 600;
+                    min-width: 75px;
                     text-align: center;
                 }}
                 .activity-action.comment {{ background: rgba(74,222,128,0.2); color: #4ade80; }}
                 .activity-action.upvote {{ background: rgba(96,165,250,0.2); color: #60a5fa; }}
                 .activity-action.error {{ background: rgba(248,113,113,0.3); color: #f87171; }}
-                .activity-details {{
-                    flex: 1;
-                    margin-left: 1rem;
+                .activity-details {{ flex: 1; margin-left: 1rem; }}
+                .activity-title {{ font-weight: 500; font-size: 0.95rem; }}
+                .activity-meta {{ display: flex; align-items: center; gap: 0.75rem; margin-top: 0.25rem; }}
+                .activity-time {{ color: #666; font-size: 0.8rem; }}
+                .trigger-badge {{
+                    background: rgba(255,255,255,0.1);
+                    padding: 0.1rem 0.5rem;
+                    border-radius: 10px;
+                    font-size: 0.7rem;
+                    color: #888;
                 }}
-                .activity-title {{ font-weight: 500; }}
-                .activity-time {{ color: #666; font-size: 0.85rem; }}
                 .activity-link {{
                     color: #60a5fa;
                     text-decoration: none;
                     font-size: 0.85rem;
-                }}
-                .activity-link:hover {{ text-decoration: underline; }}
-                .schedule {{
-                    background: rgba(255,255,255,0.05);
-                    border-radius: 12px;
-                    padding: 1.5rem;
-                    border: 1px solid rgba(255,255,255,0.1);
-                }}
-                .schedule h2 {{ margin-bottom: 1rem; font-size: 1.2rem; }}
-                .schedule-item {{
-                    display: flex;
-                    justify-content: space-between;
-                    padding: 0.5rem 0;
-                    border-bottom: 1px solid rgba(255,255,255,0.05);
-                }}
-                .schedule-item:last-child {{ border-bottom: none; }}
-                .topics {{
-                    margin-top: 1rem;
-                    padding-top: 1rem;
-                    border-top: 1px solid rgba(255,255,255,0.1);
-                }}
-                .topics h3 {{ font-size: 0.9rem; color: #888; margin-bottom: 0.5rem; }}
-                .topic-item {{
-                    background: rgba(255,255,255,0.05);
-                    padding: 0.5rem 0.75rem;
+                    padding: 0.25rem 0.75rem;
+                    border: 1px solid rgba(96,165,250,0.3);
                     border-radius: 6px;
+                    transition: all 0.2s;
+                }}
+                .activity-link:hover {{ background: rgba(96,165,250,0.1); }}
+                .job-card {{
+                    background: rgba(255,255,255,0.03);
+                    border-radius: 10px;
+                    padding: 1rem;
+                    margin-bottom: 0.75rem;
+                    border: 1px solid rgba(255,255,255,0.05);
+                }}
+                .job-card:last-child {{ margin-bottom: 0; }}
+                .job-header {{
+                    display: flex;
+                    align-items: center;
+                    gap: 0.5rem;
+                    margin-bottom: 0.5rem;
+                }}
+                .job-icon {{ font-size: 1.25rem; }}
+                .job-name {{ font-weight: 600; font-size: 1rem; }}
+                .job-interval {{
+                    margin-left: auto;
+                    background: rgba(74,222,128,0.15);
+                    color: #4ade80;
+                    padding: 0.2rem 0.5rem;
+                    border-radius: 6px;
+                    font-size: 0.75rem;
+                }}
+                .job-desc {{ color: #888; font-size: 0.85rem; margin-bottom: 0.5rem; }}
+                .job-next {{
+                    display: flex;
+                    align-items: center;
+                    gap: 0.5rem;
+                    font-size: 0.85rem;
+                }}
+                .job-next > span:first-child {{ color: #666; }}
+                .job-time {{ color: #ffa500; font-weight: 600; }}
+                .job-until {{ color: #888; }}
+                .topics {{ margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid rgba(255,255,255,0.1); }}
+                .topics h3 {{ font-size: 0.9rem; color: #888; margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.5rem; }}
+                .topic-item {{
+                    background: rgba(255,255,255,0.03);
+                    padding: 0.6rem 0.75rem;
+                    border-radius: 8px;
                     margin-bottom: 0.5rem;
                     font-size: 0.9rem;
+                    display: flex;
+                    align-items: flex-start;
+                    gap: 0.75rem;
                 }}
-                .empty {{ color: #666; font-style: italic; }}
-                .refresh {{
+                .topic-num {{
+                    background: rgba(255,107,107,0.2);
+                    color: #ff6b6b;
+                    width: 22px;
+                    height: 22px;
+                    border-radius: 50%;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    font-size: 0.75rem;
+                    font-weight: 600;
+                    flex-shrink: 0;
+                }}
+                .empty {{ color: #666; font-style: italic; padding: 0.5rem 0; }}
+                .footer {{
                     text-align: center;
                     margin-top: 2rem;
                     color: #666;
                     font-size: 0.85rem;
                 }}
-                .refresh a {{ color: #60a5fa; }}
+                .footer a {{ color: #60a5fa; text-decoration: none; }}
+                .footer a:hover {{ text-decoration: underline; }}
+                .two-col {{
+                    display: grid;
+                    grid-template-columns: 1fr 1fr;
+                    gap: 1.5rem;
+                }}
+                @media (max-width: 768px) {{
+                    .two-col {{ grid-template-columns: 1fr; }}
+                }}
             </style>
         </head>
         <body>
             <div class="container">
                 <div class="header">
-                    <h1>🦞 Azoni-AI</h1>
-                    <p>Autonomous Moltbook Agent</p>
+                    {lobster_svg.replace('width="64"', 'width="64" class="header-logo"')}
+                    <h1>Azoni-AI</h1>
+                    <p class="subtitle">Autonomous Moltbook Agent</p>
+                    <p class="time">{current_time}</p>
+                    <p class="date">{current_date}</p>
+                    {f'<p class="username">@{moltbook_username}</p>' if moltbook_username else ''}
                 </div>
                 
                 <div class="grid">
@@ -692,36 +842,49 @@ async def root():
                         <div class="value {moltbook_class}">{moltbook_status}</div>
                     </div>
                     <div class="card">
+                        <h3>Scheduler</h3>
+                        <div class="value {scheduler_class}">{scheduler_status}</div>
+                    </div>
+                    <div class="card">
                         <h3>Autonomous</h3>
                         <div class="value {auto_class}">{auto_text}</div>
                     </div>
                     <div class="card">
-                        <h3>Posts Today</h3>
+                        <h3>Posts</h3>
                         <div class="value">{posts_today}</div>
                     </div>
                     <div class="card">
-                        <h3>Comments Today</h3>
+                        <h3>Comments</h3>
                         <div class="value">{comments_today}</div>
+                    </div>
+                    <div class="card">
+                        <h3>Upvotes</h3>
+                        <div class="value">{upvotes_today}</div>
                     </div>
                 </div>
                 
-                <div class="activity">
+                <div class="two-col">
+                    <div class="section">
+                        <h2>⏰ Scheduled Jobs</h2>
+                        {schedule_html}
+                    </div>
+                    
+                    <div class="section">
+                        <h2>📝 Post Topics Queue</h2>
+                        {topics_html if topics else '<div class="empty">No topics queued - agent will pick interesting topics from feed</div>'}
+                        <div style="margin-top: 1rem; font-size: 0.8rem; color: #666;">
+                            {len(topics)} topic{"s" if len(topics) != 1 else ""} in queue
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="section">
                     <h2>📋 Recent Activity</h2>
                     {activity_html}
                 </div>
                 
-                <div class="schedule">
-                    <h2>⏰ Upcoming Jobs</h2>
-                    {schedule_html}
-                    
-                    <div class="topics">
-                        <h3>📝 Post Topics Queue ({len(topics)})</h3>
-                        {topics_html}
-                    </div>
-                </div>
-                
-                <div class="refresh">
-                    Auto-refreshes every 60 seconds • <a href="/status">JSON API</a>
+                <div class="footer">
+                    Auto-refreshes every 60 seconds • <a href="/status">JSON API</a> • <a href="https://www.moltbook.com/u/Azoni-AI" target="_blank">View Profile ↗</a>
                 </div>
             </div>
             <script>
@@ -734,6 +897,8 @@ async def root():
         
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
+        import traceback
+        traceback.print_exc()
         # Return a simple error page
         return HTMLResponse(content=f"""
         <!DOCTYPE html>

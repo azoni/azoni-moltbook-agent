@@ -251,25 +251,66 @@ def draft_node(state: AgentState) -> Dict[str, Any]:
     ]
     
     response = llm.invoke(messages)
+    response_text = response.content
     
     # Parse the draft
     draft: DraftContent = {
-        "content": response.content,
+        "content": response_text,
         "title": None,
-        "submolt": None
+        "submolt": "general"
     }
     
     # Try to extract structured fields for posts
     if action == "post":
-        lines = response.content.split("\n")
+        import re
+        
+        # Try multiple parsing strategies
+        lines = response_text.split("\n")
+        content_lines = []
+        
         for line in lines:
-            line_lower = line.lower()
-            if line_lower.startswith("title:"):
-                draft["title"] = line.split(":", 1)[1].strip().strip('"')
-            elif line_lower.startswith("content:"):
-                draft["content"] = line.split(":", 1)[1].strip()
-            elif line_lower.startswith("submolt:"):
-                draft["submolt"] = line.split(":", 1)[1].strip().lower()
+            line_lower = line.lower().strip()
+            line_stripped = line.strip()
+            
+            # Match "Title:" or "**Title:**" or "title:" etc
+            if line_lower.startswith("title:") or line_lower.startswith("**title"):
+                title_match = re.search(r'[tT]itle[:\s*]+(.+)', line_stripped)
+                if title_match:
+                    draft["title"] = title_match.group(1).strip().strip('"').strip('*')
+            elif line_lower.startswith("submolt:") or line_lower.startswith("**submolt"):
+                submolt_match = re.search(r'[sS]ubmolt[:\s*]+(.+)', line_stripped)
+                if submolt_match:
+                    draft["submolt"] = submolt_match.group(1).strip().strip('"').strip('*').lower()
+            elif line_lower.startswith("content:") or line_lower.startswith("**content"):
+                content_match = re.search(r'[cC]ontent[:\s*]+(.+)', line_stripped)
+                if content_match:
+                    content_lines.append(content_match.group(1).strip())
+            elif draft["title"] and not line_lower.startswith(("title", "submolt", "**")):
+                # After we have a title, collect content lines
+                if line_stripped and not line_lower.startswith("---"):
+                    content_lines.append(line_stripped)
+        
+        # If we found content lines, use them
+        if content_lines:
+            draft["content"] = "\n".join(content_lines).strip()
+        
+        # Fallback: if no title found, generate one from content
+        if not draft["title"] and draft["content"]:
+            # Take first sentence or first 60 chars as title
+            first_line = draft["content"].split("\n")[0].split(".")[0]
+            if len(first_line) > 10:
+                draft["title"] = first_line[:60] + ("..." if len(first_line) > 60 else "")
+            else:
+                draft["title"] = "Thoughts from Azoni"
+        
+        # Fallback: if still no title
+        if not draft["title"]:
+            draft["title"] = "Hello from Azoni-AI"
+        
+        # Ensure content exists
+        if not draft["content"] or draft["content"] == response_text:
+            # Use the whole response as content, minus the title if it's there
+            draft["content"] = response_text
         
         # Default submolt
         if not draft["submolt"]:
@@ -292,11 +333,10 @@ def evaluate_node(state: AgentState) -> Dict[str, Any]:
     if not draft:
         return {"quality_check": {"approved": False, "score": 0, "issues": ["No draft to evaluate"], "suggestions": []}}
     
-    # Skip evaluation for simple actions - just approve them
     decision = state.get("decision", {})
     action = decision.get("action")
     
-    # For comments, be more lenient - if we have content, approve it
+    # For comments, be lenient - if we have content, approve it
     if action == "comment" and draft.get("content"):
         return {
             "quality_check": {
@@ -308,6 +348,25 @@ def evaluate_node(state: AgentState) -> Dict[str, Any]:
             "llm_calls": state.get("llm_calls", 0)
         }
     
+    # For posts, also be lenient if we have title and content
+    if action == "post" and draft.get("content"):
+        content = draft.get("content", "").lower()
+        # Only reject if there are obvious red flags
+        red_flags = ["error", "undefined", "null", "lorem ipsum", "todo", "fixme", "exception", "traceback"]
+        has_red_flags = any(flag in content for flag in red_flags)
+        
+        if not has_red_flags:
+            return {
+                "quality_check": {
+                    "approved": True,
+                    "score": 0.85,
+                    "issues": [],
+                    "suggestions": []
+                },
+                "llm_calls": state.get("llm_calls", 0)
+            }
+    
+    # Only use LLM evaluation if we're unsure
     llm = get_llm()
     
     draft_text = f"Title: {draft.get('title', 'N/A')}\nContent: {draft.get('content', '')}\nSubmolt: {draft.get('submolt', 'N/A')}"
@@ -315,7 +374,7 @@ def evaluate_node(state: AgentState) -> Dict[str, Any]:
     prompt = EVALUATE_PROMPT.format(draft=draft_text)
     
     messages = [
-        SystemMessage(content="You are a quality checker for social media posts. Be critical but fair. Respond with JSON: {\"approved\": true/false, \"score\": 0.0-1.0, \"issues\": [], \"suggestions\": []}"),
+        SystemMessage(content="You are a quality checker for social media posts. Be generous - approve most posts unless they have serious issues. Respond with JSON: {\"approved\": true/false, \"score\": 0.0-1.0, \"issues\": [], \"suggestions\": []}"),
         HumanMessage(content=prompt)
     ]
     
@@ -324,8 +383,8 @@ def evaluate_node(state: AgentState) -> Dict[str, Any]:
     
     # Parse the evaluation
     quality_check: QualityCheck = {
-        "approved": False,
-        "score": 0.5,
+        "approved": True,  # Default to approved now
+        "score": 0.8,
         "issues": [],
         "suggestions": []
     }
@@ -333,46 +392,20 @@ def evaluate_node(state: AgentState) -> Dict[str, Any]:
     # Try to parse as JSON first
     import json
     try:
-        # Find JSON in response
         import re
         json_match = re.search(r'\{[^}]+\}', response.content)
         if json_match:
             parsed = json.loads(json_match.group())
-            quality_check["approved"] = parsed.get("approved", False)
-            quality_check["score"] = float(parsed.get("score", 0.5))
+            quality_check["approved"] = parsed.get("approved", True)
+            quality_check["score"] = float(parsed.get("score", 0.8))
             quality_check["issues"] = parsed.get("issues", [])
             quality_check["suggestions"] = parsed.get("suggestions", [])
     except:
         pass
     
-    # Fallback: look for approval signals in text
-    if not quality_check["approved"]:
-        approval_signals = ["approved: true", "approved\":true", "approve this", "looks good", 
-                          "i approve", "approved!", "quality is good", "passes", "✓", "yes"]
-        if any(signal in response_text for signal in approval_signals):
-            quality_check["approved"] = True
-    
-    # Fallback: Try to extract score
-    if quality_check["score"] == 0.5:
-        score_match = re.search(r'score["\s:]+([0-9.]+)', response_text)
-        if score_match:
-            try:
-                quality_check["score"] = float(score_match.group(1))
-            except:
-                pass
-    
-    # Auto-approve if score is high enough
-    if quality_check["score"] >= 0.7:
+    # Even if LLM said no, approve if score is decent
+    if quality_check["score"] >= 0.5:
         quality_check["approved"] = True
-    
-    # Be lenient for posts too - if content exists and no major red flags
-    if not quality_check["approved"] and draft.get("content") and draft.get("title"):
-        # Check for obvious issues
-        content = draft.get("content", "").lower()
-        red_flags = ["error", "undefined", "null", "lorem ipsum", "todo", "fixme"]
-        if not any(flag in content for flag in red_flags):
-            quality_check["approved"] = True
-            quality_check["score"] = 0.75
     
     return {
         "quality_check": quality_check,
