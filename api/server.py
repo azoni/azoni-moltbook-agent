@@ -42,7 +42,10 @@ def check_autonomous_mode() -> bool:
         db = get_firestore()
         config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
         if config_doc.exists:
-            return config_doc.to_dict().get("autonomous_mode", False)
+            mode = config_doc.to_dict().get("autonomous_mode", False)
+            logger.info(f"Autonomous mode check: {mode}")
+            return mode
+        logger.warning("No config document found - autonomous mode OFF")
         return False
     except Exception as e:
         logger.error(f"Error checking autonomous mode: {e}")
@@ -321,6 +324,61 @@ def upvote_job():
 
 # ==================== App Lifecycle ====================
 
+def startup_check():
+    """Run once on startup to verify everything works."""
+    logger.info("=" * 50)
+    logger.info("STARTUP HEALTH CHECK")
+    logger.info("=" * 50)
+    
+    # Check Firestore
+    try:
+        db = get_firestore()
+        config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
+        if config_doc.exists:
+            config = config_doc.to_dict()
+            logger.info(f"  Firestore: OK")
+            logger.info(f"  Autonomous mode: {config.get('autonomous_mode', False)}")
+            logger.info(f"  Topics in queue: {len(config.get('post_topics', []))}")
+        else:
+            logger.warning(f"  Firestore: No config doc! Creating default...")
+            db.collection(MOLTBOOK_CONFIG).document("settings").set({
+                "autonomous_mode": False,
+                "post_topics": []
+            })
+    except Exception as e:
+        logger.error(f"  Firestore: FAILED - {e}")
+    
+    # Check Moltbook
+    try:
+        client = get_moltbook_client()
+        status = client.get_status()
+        logger.info(f"  Moltbook API: {status.get('status', 'unknown')}")
+    except Exception as e:
+        logger.error(f"  Moltbook API: FAILED - {e}")
+    
+    # Check OpenRouter / LLM
+    try:
+        from langchain_openai import ChatOpenAI
+        from langchain_core.messages import HumanMessage
+        llm = ChatOpenAI(
+            model=settings.default_model.split("/")[-1],
+            openai_api_key=settings.openrouter_api_key,
+            openai_api_base="https://openrouter.ai/api/v1",
+            default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
+        )
+        resp = llm.invoke([HumanMessage(content="Say 'ok' in one word.")])
+        logger.info(f"  LLM (OpenRouter): OK - {resp.content[:20]}")
+    except Exception as e:
+        logger.error(f"  LLM (OpenRouter): FAILED - {e}")
+    
+    # List scheduled jobs
+    logger.info(f"  Scheduler running: {scheduler.running}")
+    for job in scheduler.get_jobs():
+        logger.info(f"  Job: {job.id} -> next run: {job.next_run_time}")
+    
+    logger.info("=" * 50)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -334,6 +392,11 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(comment_job, IntervalTrigger(minutes=12), id="comment_job", replace_existing=True)
     scheduler.add_job(reply_job, IntervalTrigger(minutes=8), id="reply_job", replace_existing=True)
     scheduler.add_job(upvote_job, IntervalTrigger(minutes=15), id="upvote_job", replace_existing=True)
+    
+    # Run health check 10 seconds after startup
+    from apscheduler.triggers.date import DateTrigger
+    scheduler.add_job(startup_check, DateTrigger(run_date=datetime.now() + timedelta(seconds=10)), id="startup_check")
+    
     scheduler.start()
     logger.info("Scheduler started with post(45m), comment(12m), reply(8m), upvote(15m) jobs")
     
@@ -611,7 +674,7 @@ async def root():
             topics_html = '<div class="empty">No topics queued - agent will pick interesting topics from feed</div>'
         
         # SVG Lobster favicon
-        lobster_svg = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+        lobster_svg = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
             <defs><linearGradient id="lg" x1="0%" y1="0%" x2="100%" y2="100%">
                 <stop offset="0%" style="stop-color:#ff6b6b"/><stop offset="100%" style="stop-color:#ee5a5a"/>
             </linearGradient></defs>
@@ -626,6 +689,9 @@ async def root():
             <ellipse cx="58" cy="40" rx="4" ry="6" fill="url(#lg)"/>
             <path d="M26 56 Q28 62 32 58 Q36 62 38 56" stroke="#ff6b6b" stroke-width="2" fill="none"/>
         </svg>'''
+        
+        # Inline logo version (constrained size)
+        lobster_logo = lobster_svg.replace('width="64" height="64"', 'width="48" height="48" class="header-logo"')
         
         favicon_base64 = "data:image/svg+xml;base64," + __import__('base64').b64encode(lobster_svg.encode()).decode()
         
@@ -833,7 +899,7 @@ async def root():
         <body>
             <div class="container">
                 <div class="header">
-                    {lobster_svg.replace('width="64"', 'width="64" class="header-logo"')}
+                    {lobster_logo}
                     <h1>Azoni-AI</h1>
                     <p class="subtitle">Autonomous Moltbook Agent</p>
                     <p class="time">{current_time}</p>
