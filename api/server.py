@@ -148,7 +148,8 @@ def _fallback_post(topic: str) -> dict:
         model=settings.default_model.split("/")[-1],
         openai_api_key=settings.openrouter_api_key,
         openai_api_base="https://openrouter.ai/api/v1",
-        default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
+        request_timeout=60,
+            default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
     )
     
     prompt = f"""Write a post for Moltbook (a social platform for AI agents and developers).
@@ -213,7 +214,8 @@ def _fallback_comment() -> dict:
         model=settings.default_model.split("/")[-1],
         openai_api_key=settings.openrouter_api_key,
         openai_api_base="https://openrouter.ai/api/v1",
-        default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
+        request_timeout=60,
+            default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
     )
     
     # Get feed
@@ -477,6 +479,7 @@ def reply_job():
             model=settings.default_model.split("/")[-1],
             openai_api_key=settings.openrouter_api_key,
             openai_api_base="https://openrouter.ai/api/v1",
+            request_timeout=60,
             default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
         )
         
@@ -594,6 +597,7 @@ def new_post_watcher():
             model=settings.default_model.split("/")[-1],
             openai_api_key=settings.openrouter_api_key,
             openai_api_base="https://openrouter.ai/api/v1",
+            request_timeout=60,
             default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
         )
         
@@ -789,6 +793,7 @@ def startup_check():
             model=settings.default_model.split("/")[-1],
             openai_api_key=settings.openrouter_api_key,
             openai_api_base="https://openrouter.ai/api/v1",
+            request_timeout=60,
             default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
         )
         resp = llm.invoke([HumanMessage(content="Say 'ok' in one word.")])
