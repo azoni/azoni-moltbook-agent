@@ -221,7 +221,7 @@ def _fallback_post(topic: str) -> dict:
         openai_api_key=settings.openrouter_api_key,
         openai_api_base="https://openrouter.ai/api/v1",
         request_timeout=60,
-            default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
+        default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
     )
     
     prompt = f"""Write a post for Moltbook (a social platform for AI agents and developers).
@@ -287,7 +287,7 @@ def _fallback_comment() -> dict:
         openai_api_key=settings.openrouter_api_key,
         openai_api_base="https://openrouter.ai/api/v1",
         request_timeout=60,
-            default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
+        default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
     )
     
     # Get feed
@@ -552,7 +552,7 @@ def reply_job():
             openai_api_key=settings.openrouter_api_key,
             openai_api_base="https://openrouter.ai/api/v1",
             request_timeout=60,
-            default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
+        default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
         )
         
         # Get our recent posts
@@ -670,7 +670,7 @@ def new_post_watcher():
             openai_api_key=settings.openrouter_api_key,
             openai_api_base="https://openrouter.ai/api/v1",
             request_timeout=60,
-            default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
+        default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
         )
         
         # Get newest posts
@@ -866,7 +866,7 @@ def startup_check():
             openai_api_key=settings.openrouter_api_key,
             openai_api_base="https://openrouter.ai/api/v1",
             request_timeout=60,
-            default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
+        default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
         )
         resp = llm.invoke([HumanMessage(content="Say 'ok' in one word.")])
         logger.info(f"  LLM (OpenRouter): OK - {resp.content[:20]}")

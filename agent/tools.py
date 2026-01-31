@@ -14,7 +14,14 @@ class MoltbookClient:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or settings.moltbook_api_key
         self.base_url = settings.moltbook_base_url
-        self.client = httpx.Client(timeout=30.0)
+        # Don't reuse httpx client across threads - create per request
+    
+    def _get_client(self) -> httpx.Client:
+        """Create a fresh client for each request (thread-safe)."""
+        return httpx.Client(
+            timeout=30.0,
+            follow_redirects=True,  # Follow redirects but re-attach headers
+        )
     
     def _headers(self) -> Dict[str, str]:
         """Get headers for API requests."""
@@ -22,6 +29,13 @@ class MoltbookClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
+    
+    def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """Make a request with proper error handling."""
+        with self._get_client() as client:
+            response = getattr(client, method)(url, headers=self._headers(), **kwargs)
+            response.raise_for_status()
+            return response
     
     # ==================== Registration ====================
     
@@ -39,30 +53,25 @@ class MoltbookClient:
                 "important": "⚠️ SAVE YOUR API KEY!"
             }
         """
-        response = self.client.post(
-            f"{self.base_url}/agents/register",
-            headers={"Content-Type": "application/json"},
-            json={"name": name, "description": description}
-        )
-        response.raise_for_status()
-        return response.json()
+        with self._get_client() as client:
+            response = client.post(
+                f"{self.base_url}/agents/register",
+                headers={"Content-Type": "application/json"},
+                json={"name": name, "description": description}
+            )
+            response.raise_for_status()
+            return response.json()
     
     def get_status(self) -> Dict[str, Any]:
         """Check claim status of the agent."""
-        response = self.client.get(
-            f"{self.base_url}/agents/status",
-            headers=self._headers()
+        response = self._request("get", f"{self.base_url}/agents/status"
         )
-        response.raise_for_status()
         return response.json()
     
     def get_me(self) -> Dict[str, Any]:
         """Get current agent profile."""
-        response = self.client.get(
-            f"{self.base_url}/agents/me",
-            headers=self._headers()
+        response = self._request("get", f"{self.base_url}/agents/me"
         )
-        response.raise_for_status()
         return response.json()
     
     # ==================== Feed & Posts ====================
@@ -85,33 +94,24 @@ class MoltbookClient:
         if submolt:
             params["submolt"] = submolt
         
-        response = self.client.get(
-            f"{self.base_url}/posts",
-            headers=self._headers(),
+        response = self._request("get", f"{self.base_url}/posts",
             params=params
         )
-        response.raise_for_status()
         data = response.json()
         return data.get("posts", data.get("data", []))
     
     def get_personalized_feed(self, sort: str = "hot", limit: int = 25) -> List[Dict[str, Any]]:
         """Get personalized feed (subscribed submolts + followed moltys)."""
-        response = self.client.get(
-            f"{self.base_url}/feed",
-            headers=self._headers(),
+        response = self._request("get", f"{self.base_url}/feed",
             params={"sort": sort, "limit": limit}
         )
-        response.raise_for_status()
         data = response.json()
         return data.get("posts", data.get("data", []))
     
     def get_post(self, post_id: str) -> Dict[str, Any]:
         """Get a single post by ID."""
-        response = self.client.get(
-            f"{self.base_url}/posts/{post_id}",
-            headers=self._headers()
+        response = self._request("get", f"{self.base_url}/posts/{post_id}"
         )
-        response.raise_for_status()
         return response.json()
     
     def create_post(
@@ -136,24 +136,18 @@ class MoltbookClient:
         if url:
             payload["url"] = url
         
-        response = self.client.post(
-            f"{self.base_url}/posts",
-            headers=self._headers(),
+        response = self._request("post", f"{self.base_url}/posts",
             json=payload
         )
-        response.raise_for_status()
         return response.json()
     
     # ==================== Comments ====================
     
     def get_comments(self, post_id: str, sort: str = "top") -> List[Dict[str, Any]]:
         """Get comments on a post."""
-        response = self.client.get(
-            f"{self.base_url}/posts/{post_id}/comments",
-            headers=self._headers(),
+        response = self._request("get", f"{self.base_url}/posts/{post_id}/comments",
             params={"sort": sort}
         )
-        response.raise_for_status()
         data = response.json()
         return data.get("comments", data.get("data", []))
     
@@ -175,74 +169,53 @@ class MoltbookClient:
         if parent_id:
             payload["parent_id"] = parent_id
         
-        response = self.client.post(
-            f"{self.base_url}/posts/{post_id}/comments",
-            headers=self._headers(),
+        response = self._request("post", f"{self.base_url}/posts/{post_id}/comments",
             json=payload
         )
-        response.raise_for_status()
         return response.json()
     
     # ==================== Voting ====================
     
     def upvote_post(self, post_id: str) -> Dict[str, Any]:
         """Upvote a post."""
-        response = self.client.post(
-            f"{self.base_url}/posts/{post_id}/upvote",
-            headers=self._headers()
+        response = self._request("post", f"{self.base_url}/posts/{post_id}/upvote"
         )
-        response.raise_for_status()
         return response.json()
     
     def downvote_post(self, post_id: str) -> Dict[str, Any]:
         """Downvote a post."""
-        response = self.client.post(
-            f"{self.base_url}/posts/{post_id}/downvote",
-            headers=self._headers()
+        response = self._request("post", f"{self.base_url}/posts/{post_id}/downvote"
         )
-        response.raise_for_status()
         return response.json()
     
     def upvote_comment(self, comment_id: str) -> Dict[str, Any]:
         """Upvote a comment."""
-        response = self.client.post(
-            f"{self.base_url}/comments/{comment_id}/upvote",
-            headers=self._headers()
+        response = self._request("post", f"{self.base_url}/comments/{comment_id}/upvote"
         )
-        response.raise_for_status()
         return response.json()
     
     # ==================== Submolts ====================
     
     def list_submolts(self) -> List[Dict[str, Any]]:
         """List all submolts."""
-        response = self.client.get(
-            f"{self.base_url}/submolts",
-            headers=self._headers()
+        response = self._request("get", f"{self.base_url}/submolts"
         )
-        response.raise_for_status()
         data = response.json()
         return data.get("submolts", data.get("data", []))
     
     def subscribe_submolt(self, submolt_name: str) -> Dict[str, Any]:
         """Subscribe to a submolt."""
-        response = self.client.post(
-            f"{self.base_url}/submolts/{submolt_name}/subscribe",
-            headers=self._headers()
+        response = self._request("post", f"{self.base_url}/submolts/{submolt_name}/subscribe"
         )
-        response.raise_for_status()
         return response.json()
     
     # ==================== Search ====================
     
     def search(self, query: str, limit: int = 25) -> Dict[str, Any]:
         """Search posts, moltys, and submolts."""
-        response = self.client.get(
-            f"{self.base_url}/search",
-            headers=self._headers(),
+        response = self._request("get", f"{self.base_url}/search",
             params={"q": query, "limit": limit}
         )
-        response.raise_for_status()
         return response.json()
     
     # ==================== Profile ====================
@@ -259,22 +232,16 @@ class MoltbookClient:
         if metadata:
             payload["metadata"] = metadata
         
-        response = self.client.patch(
-            f"{self.base_url}/agents/me",
-            headers=self._headers(),
+        response = self._request("patch", f"{self.base_url}/agents/me",
             json=payload
         )
-        response.raise_for_status()
         return response.json()
     
     def get_agent_profile(self, name: str) -> Dict[str, Any]:
         """View another molty's profile."""
-        response = self.client.get(
-            f"{self.base_url}/agents/profile",
-            headers=self._headers(),
+        response = self._request("get", f"{self.base_url}/agents/profile",
             params={"name": name}
         )
-        response.raise_for_status()
         return response.json()
 
 
