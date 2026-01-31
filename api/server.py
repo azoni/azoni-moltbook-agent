@@ -574,6 +574,112 @@ Keep it short (1-3 sentences). Be genuine.'''
         log_job("reply", "failed", {"error": str(e)[:100]})
 
 
+def new_post_watcher():
+    """Watch for new posts and comment on them immediately. Runs every 2 min."""
+    logger.info(f"New post watcher triggered at {datetime.now()}")
+    
+    if not check_autonomous_mode():
+        return
+    
+    try:
+        from langchain_openai import ChatOpenAI
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from agent.personality import AZONI_IDENTITY
+        import time
+        
+        client = get_moltbook_client()
+        db = get_firestore()
+        
+        llm = ChatOpenAI(
+            model=settings.default_model.split("/")[-1],
+            openai_api_key=settings.openrouter_api_key,
+            openai_api_base="https://openrouter.ai/api/v1",
+            default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
+        )
+        
+        # Get newest posts
+        new_posts = client.get_feed(sort="new", limit=10)
+        
+        commented = 0
+        max_per_run = 3
+        
+        for post in new_posts:
+            if commented >= max_per_run:
+                break
+            
+            post_id = post.get("id")
+            author = post.get("author", "")
+            if isinstance(author, dict):
+                author = author.get("name", "")
+            
+            # Skip our own posts
+            if author.lower() in ["azoni-ai", "azoni"]:
+                continue
+            
+            # Check if we already commented
+            existing = list(db.collection(MOLTBOOK_ACTIVITY)
+                .where("action", "==", "comment")
+                .where("decision.target_post_id", "==", post_id)
+                .limit(1).get())
+            
+            if existing:
+                continue
+            
+            # This is a new post we haven't commented on — go!
+            post_title = post.get("title", "")
+            post_content = post.get("content", "")
+            post_author = author
+            
+            logger.info(f"New post watcher: Found new post '{post_title}' by {post_author}")
+            
+            prompt = f"""Write a comment for this NEW Moltbook post. Being one of the first commenters is great!
+
+Post title: {post_title}
+Post content: {post_content[:500]}
+Author: {post_author}
+
+Write a genuine, engaging comment (2-4 sentences). Welcome the post, add insight, or ask a good question.
+Just write the comment text directly, no labels."""
+
+            response = llm.invoke([
+                SystemMessage(content=AZONI_IDENTITY),
+                HumanMessage(content=prompt)
+            ])
+            
+            comment_text = response.content.strip()
+            for prefix in ["Comment:", "comment:", "Response:", "response:"]:
+                if comment_text.startswith(prefix):
+                    comment_text = comment_text[len(prefix):].strip()
+            
+            result = client.create_comment(post_id=post_id, content=comment_text)
+            
+            db.collection(MOLTBOOK_ACTIVITY).add({
+                "action": "comment",
+                "timestamp": datetime.now(),
+                "date": datetime.now().date().isoformat(),
+                "draft": {"content": comment_text[:200]},
+                "decision": {"action": "comment", "reason": f"Early comment on '{post_title}'", "target_post_id": post_id},
+                "result": result,
+                "trigger": "new_post_watcher"
+            })
+            
+            logger.info(f"New post watcher: Commented on '{post_title}'")
+            commented += 1
+            time.sleep(1)
+        
+        log_job("watcher", "success" if commented > 0 else "skipped", {
+            "commented": commented,
+            "posts_checked": len(new_posts),
+            "reason": "" if commented > 0 else "no new uncommented posts"
+        })
+            
+    except Exception as e:
+        logger.error(f"New post watcher failed: {e}")
+        import traceback
+        traceback.print_exc()
+        log_job("watcher", "failed", {"error": str(e)[:100]})
+
+
 def upvote_job():
     """Upvote good content every 20 minutes."""
     logger.info(f"Upvote job triggered at {datetime.now()}")
@@ -708,16 +814,17 @@ async def lifespan(app: FastAPI):
     # - Replies quickly (shows engagement)
     # - Upvotes regularly (community participation)
     scheduler.add_job(post_job, IntervalTrigger(minutes=45), id="post_job", replace_existing=True)
-    scheduler.add_job(comment_job, IntervalTrigger(minutes=12), id="comment_job", replace_existing=True)
+    scheduler.add_job(comment_job, IntervalTrigger(minutes=3), id="comment_job", replace_existing=True)
     scheduler.add_job(reply_job, IntervalTrigger(minutes=8), id="reply_job", replace_existing=True)
     scheduler.add_job(upvote_job, IntervalTrigger(minutes=15), id="upvote_job", replace_existing=True)
+    scheduler.add_job(new_post_watcher, IntervalTrigger(minutes=2), id="new_post_watcher", replace_existing=True)
     
     # Run health check 10 seconds after startup
     from apscheduler.triggers.date import DateTrigger
     scheduler.add_job(startup_check, DateTrigger(run_date=datetime.now() + timedelta(seconds=10)), id="startup_check")
     
     scheduler.start()
-    logger.info("Scheduler started with post(45m), comment(12m), reply(8m), upvote(15m) jobs")
+    logger.info("Scheduler started with post(45m), comment(3m), reply(8m), upvote(15m), new_post_watcher(2m) jobs")
     
     yield
     
@@ -902,9 +1009,10 @@ async def root():
         
         job_details = {
             "post": {"interval": "45 min", "desc": "Creates engaging posts on interesting topics", "icon": "📝"},
-            "comment": {"interval": "12 min", "desc": "Comments on posts to build relationships", "icon": "💬"},
+            "comment": {"interval": "3 min", "desc": "Comments on posts to build relationships", "icon": "💬"},
             "reply": {"interval": "8 min", "desc": "Replies to comments on your posts quickly", "icon": "↩️"},
             "upvote": {"interval": "15 min", "desc": "Upvotes quality content from the community", "icon": "👍"},
+            "new_post_watcher": {"interval": "2 min", "desc": "Watches for new posts and comments first", "icon": "👀"},
         }
         
         next_jobs = []
@@ -914,7 +1022,7 @@ async def root():
                     # Convert to Seattle time
                     next_seattle = job.next_run_time.astimezone(seattle_tz)
                     job_name = job.id.replace("_job", "")
-                    details = job_details.get(job_name, {"interval": "?", "desc": "Scheduled task", "icon": "⚡"})
+                    details = job_details.get(job_name, job_details.get(job.id, {"interval": "?", "desc": "Scheduled task", "icon": "⚡"}))
                     
                     # Calculate time until
                     time_until = job.next_run_time - datetime.now(pytz.utc)
