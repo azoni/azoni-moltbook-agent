@@ -212,6 +212,26 @@ class MoltbookClient:
         response = self._request("get", f"{self.base_url}/agents/status")
         return response.json()
     
+    def get_status_fast(self) -> Dict[str, Any]:
+        """Quick status check for dashboard - short timeout, NO retries."""
+        if _circuit_is_open():
+            return {"status": "circuit_breaker_open", "error": "API temporarily unavailable"}
+        try:
+            with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=8.0, write=5.0, pool=5.0)) as client:
+                resp = client.get(f"{self.base_url}/agents/status", headers=self._headers())
+                resp.raise_for_status()
+                _record_success()
+                return resp.json()
+        except httpx.TimeoutException:
+            logger.warning("Moltbook status fast-check timed out (8s limit)")
+            return {"status": "timeout", "error": "Moltbook API slow"}
+        except httpx.HTTPStatusError as e:
+            logger.warning(f"Moltbook status fast-check HTTP {e.response.status_code}")
+            return {"status": f"http_{e.response.status_code}", "error": str(e.response.status_code)}
+        except Exception as e:
+            logger.warning(f"Moltbook status fast-check failed: {type(e).__name__}")
+            return {"status": "error", "error": str(e)}
+    
     def get_me(self) -> Dict[str, Any]:
         """Get current agent profile."""
         response = self._request("get", f"{self.base_url}/agents/me")

@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 import json
 import logging
+import time
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +33,29 @@ logger = logging.getLogger(__name__)
 
 # Global scheduler
 scheduler = AsyncIOScheduler()
+
+# Cache Moltbook status for 30s to prevent hammering on dashboard load
+_status_cache = {"data": None, "timestamp": 0}
+STATUS_CACHE_TTL = 30  # seconds
+
+def _get_cached_moltbook_status():
+    """Get Moltbook status with 30s cache - uses fast no-retry path."""
+    now = time.time()
+    if _status_cache["data"] is not None and (now - _status_cache["timestamp"]) < STATUS_CACHE_TTL:
+        return _status_cache["data"]
+    
+    try:
+        client = get_moltbook_client()
+        result = client.get_status_fast()
+        _status_cache["data"] = result
+        _status_cache["timestamp"] = now
+        return result
+    except Exception as e:
+        logger.warning(f"Status cache fetch failed: {e}")
+        # Return stale cache if available
+        if _status_cache["data"] is not None:
+            return _status_cache["data"]
+        return {"status": "error", "error": str(e)}
 
 
 # Default intervals (minutes)
@@ -924,7 +948,7 @@ def startup_check():
     # Check Moltbook
     try:
         client = get_moltbook_client()
-        status = client.get_status()
+        status = client.get_status_fast()
         logger.info(f"  Moltbook API: {status.get('status', 'unknown')}")
     except Exception as e:
         logger.error(f"  Moltbook API: FAILED - {e}")
@@ -1047,8 +1071,7 @@ async def root():
         moltbook_username = ""
         if settings.moltbook_api_key:
             try:
-                client = get_moltbook_client()
-                status_response = client.get_status()
+                status_response = _get_cached_moltbook_status()
                 if status_response.get("status") == "claimed":
                     moltbook_status = "Connected"
                     moltbook_class = "status-online"
@@ -1831,8 +1854,7 @@ async def get_status():
     
     if moltbook_registered:
         try:
-            client = get_moltbook_client()
-            status_response = client.get_status()
+            status_response = _get_cached_moltbook_status()
             moltbook_status = status_response.get("status")
         except Exception as e:
             moltbook_status = f"error: {str(e)}"
