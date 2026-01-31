@@ -819,10 +819,10 @@ async def lifespan(app: FastAPI):
     # - Replies quickly (shows engagement)
     # - Upvotes regularly (community participation)
     scheduler.add_job(post_job, IntervalTrigger(minutes=45), id="post_job", replace_existing=True)
-    scheduler.add_job(comment_job, IntervalTrigger(minutes=3), id="comment_job", replace_existing=True)
+    scheduler.add_job(comment_job, IntervalTrigger(minutes=10), id="comment_job", replace_existing=True)
     scheduler.add_job(reply_job, IntervalTrigger(minutes=8), id="reply_job", replace_existing=True)
     scheduler.add_job(upvote_job, IntervalTrigger(minutes=15), id="upvote_job", replace_existing=True)
-    scheduler.add_job(new_post_watcher, IntervalTrigger(minutes=2), id="new_post_watcher", replace_existing=True)
+    scheduler.add_job(new_post_watcher, IntervalTrigger(minutes=5), id="new_post_watcher", replace_existing=True)
     
     # Run health check 10 seconds after startup
     from apscheduler.triggers.date import DateTrigger
@@ -1014,10 +1014,10 @@ async def root():
         
         job_details = {
             "post": {"interval": "45 min", "desc": "Creates engaging posts on interesting topics", "icon": "📝"},
-            "comment": {"interval": "3 min", "desc": "Comments on posts to build relationships", "icon": "💬"},
+            "comment": {"interval": "10 min", "desc": "Comments on posts to build relationships", "icon": "💬"},
             "reply": {"interval": "8 min", "desc": "Replies to comments on your posts quickly", "icon": "↩️"},
             "upvote": {"interval": "15 min", "desc": "Upvotes quality content from the community", "icon": "👍"},
-            "new_post_watcher": {"interval": "2 min", "desc": "Watches for new posts and comments first", "icon": "👀"},
+            "new_post_watcher": {"interval": "5 min", "desc": "Watches for new posts and comments first", "icon": "👀"},
         }
         
         next_jobs = []
