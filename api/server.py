@@ -6,25 +6,292 @@ Provides endpoints for:
 - Status checks
 - Activity history
 - Configuration management
+- Built-in background scheduler for autonomous mode
 """
 from datetime import datetime, timedelta
 from typing import Optional, List
 import json
+import logging
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 from agent import run_agent, get_moltbook_client
 from agent.tools import MoltbookClient
 from config.settings import settings
 from config.firebase import get_firestore, MOLTBOOK_CONFIG, MOLTBOOK_ACTIVITY, MOLTBOOK_STATE
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Global scheduler
+scheduler = AsyncIOScheduler()
+
+
+# ==================== Scheduler Jobs ====================
+
+def check_autonomous_mode() -> bool:
+    """Check if autonomous mode is enabled."""
+    try:
+        db = get_firestore()
+        config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
+        if config_doc.exists:
+            return config_doc.to_dict().get("autonomous_mode", False)
+        return False
+    except Exception as e:
+        logger.error(f"Error checking autonomous mode: {e}")
+        return False
+
+
+def can_post() -> bool:
+    """Check if we can post (30 min cooldown)."""
+    try:
+        db = get_firestore()
+        posts = list(db.collection(MOLTBOOK_ACTIVITY)
+            .where("action", "==", "post")
+            .order_by("timestamp", direction="DESCENDING")
+            .limit(1)
+            .get())
+        
+        if not posts:
+            return True
+        
+        last_post_time = posts[0].to_dict().get("timestamp")
+        if last_post_time:
+            if hasattr(last_post_time, 'timestamp'):
+                last_post_time = datetime.fromtimestamp(last_post_time.timestamp())
+            elif isinstance(last_post_time, str):
+                last_post_time = datetime.fromisoformat(last_post_time.replace('Z', '+00:00'))
+            
+            time_since = datetime.now() - last_post_time.replace(tzinfo=None)
+            return time_since > timedelta(minutes=30)
+        return True
+    except Exception as e:
+        logger.error(f"Error checking post cooldown: {e}")
+        return False
+
+
+def post_job():
+    """Create new posts every 35 minutes."""
+    logger.info(f"Post job triggered at {datetime.now()}")
+    
+    if not check_autonomous_mode():
+        logger.info("Autonomous mode disabled, skipping")
+        return
+    
+    if not can_post():
+        logger.info("Post cooldown active, skipping")
+        return
+    
+    try:
+        result = run_agent(
+            trigger="heartbeat",
+            trigger_context="Create a new post about AI, coding, or your projects. Be authentic."
+        )
+        logger.info(f"Post job: {result.get('decision', {}).get('action')}, executed={result.get('executed')}")
+    except Exception as e:
+        logger.error(f"Post job failed: {e}")
+
+
+def comment_job():
+    """Comment on posts every 15 minutes."""
+    logger.info(f"Comment job triggered at {datetime.now()}")
+    
+    if not check_autonomous_mode():
+        return
+    
+    try:
+        result = run_agent(
+            trigger="heartbeat",
+            trigger_context="Find an interesting post to comment on. Add value to the discussion. Do NOT create a new post."
+        )
+        logger.info(f"Comment job: {result.get('decision', {}).get('action')}, executed={result.get('executed')}")
+    except Exception as e:
+        logger.error(f"Comment job failed: {e}")
+
+
+def reply_job():
+    """Reply to comments on our posts every 10 minutes."""
+    logger.info(f"Reply job triggered at {datetime.now()}")
+    
+    if not check_autonomous_mode():
+        return
+    
+    try:
+        from langchain_openai import ChatOpenAI
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from agent.personality import AZONI_IDENTITY
+        
+        client = get_moltbook_client()
+        db = get_firestore()
+        
+        llm = ChatOpenAI(
+            model=settings.default_model.split("/")[-1],
+            openai_api_key=settings.openrouter_api_key,
+            openai_api_base="https://openrouter.ai/api/v1",
+            default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
+        )
+        
+        # Get our recent posts
+        our_posts = list(db.collection(MOLTBOOK_ACTIVITY)
+            .where("action", "==", "post")
+            .order_by("timestamp", direction="DESCENDING")
+            .limit(5)
+            .get())
+        
+        for post_doc in our_posts:
+            post_data = post_doc.to_dict()
+            post_id = post_data.get("result", {}).get("post", {}).get("id")
+            
+            if not post_id:
+                continue
+            
+            try:
+                comments = client.get_comments(post_id)
+                
+                for comment in comments:
+                    comment_id = comment.get("id")
+                    comment_author = comment.get("author")
+                    comment_content = comment.get("content", "")
+                    
+                    if isinstance(comment_author, dict):
+                        author_name = comment_author.get("name", "unknown")
+                    else:
+                        author_name = comment_author or "unknown"
+                    
+                    if author_name.lower() in ["azoni-ai", "azoni"]:
+                        continue
+                    
+                    # Check if already replied
+                    existing = list(db.collection(MOLTBOOK_ACTIVITY)
+                        .where("action", "==", "comment")
+                        .where("decision.target_comment_id", "==", comment_id)
+                        .limit(1)
+                        .get())
+                    
+                    if existing:
+                        continue
+                    
+                    # Generate reply
+                    prompt = f'''Someone commented on your post. Write a brief, friendly reply.
+Their comment: "{comment_content}"
+Author: {author_name}
+Keep it short (1-3 sentences). Be genuine.'''
+
+                    response = llm.invoke([
+                        SystemMessage(content=AZONI_IDENTITY),
+                        HumanMessage(content=prompt)
+                    ])
+                    reply_content = response.content.strip()
+                    
+                    result = client.create_comment(post_id=post_id, content=reply_content, parent_id=comment_id)
+                    
+                    db.collection(MOLTBOOK_ACTIVITY).add({
+                        "action": "comment",
+                        "timestamp": datetime.now(),
+                        "date": datetime.now().date().isoformat(),
+                        "draft": {"content": reply_content},
+                        "decision": {"action": "comment", "reason": f"Reply to {author_name}", "target_post_id": post_id, "target_comment_id": comment_id},
+                        "result": result,
+                        "trigger": "reply_job"
+                    })
+                    
+                    logger.info(f"Replied to {author_name}")
+                    return
+                    
+            except Exception as e:
+                logger.error(f"Error on post {post_id}: {e}")
+                continue
+                
+    except Exception as e:
+        logger.error(f"Reply job failed: {e}")
+
+
+def upvote_job():
+    """Upvote good content every 20 minutes."""
+    logger.info(f"Upvote job triggered at {datetime.now()}")
+    
+    if not check_autonomous_mode():
+        return
+    
+    try:
+        client = get_moltbook_client()
+        db = get_firestore()
+        
+        # Get hot posts
+        feed = client.get_feed(sort="hot", limit=10)
+        
+        for post in feed:
+            post_id = post.get("id")
+            
+            # Check if we already upvoted
+            existing = list(db.collection(MOLTBOOK_ACTIVITY)
+                .where("action", "==", "upvote")
+                .where("decision.target_post_id", "==", post_id)
+                .limit(1)
+                .get())
+            
+            if existing:
+                continue
+            
+            # Upvote it
+            try:
+                result = client.upvote_post(post_id)
+                
+                db.collection(MOLTBOOK_ACTIVITY).add({
+                    "action": "upvote",
+                    "timestamp": datetime.now(),
+                    "date": datetime.now().date().isoformat(),
+                    "decision": {
+                        "action": "upvote",
+                        "target_post_id": post_id,
+                        "reason": f"Upvoted '{post.get('title', 'Unknown')[:50]}'"
+                    },
+                    "result": result,
+                    "trigger": "upvote_job"
+                })
+                
+                logger.info(f"Upvoted: {post.get('title', 'Unknown')[:50]}")
+                return  # Only upvote one per run
+                
+            except Exception as e:
+                logger.error(f"Failed to upvote {post_id}: {e}")
+                continue
+                
+    except Exception as e:
+        logger.error(f"Upvote job failed: {e}")
+
+
+# ==================== App Lifecycle ====================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Starting scheduler...")
+    scheduler.add_job(post_job, IntervalTrigger(minutes=35), id="post_job", replace_existing=True)
+    scheduler.add_job(comment_job, IntervalTrigger(minutes=15), id="comment_job", replace_existing=True)
+    scheduler.add_job(reply_job, IntervalTrigger(minutes=10), id="reply_job", replace_existing=True)
+    scheduler.add_job(upvote_job, IntervalTrigger(minutes=20), id="upvote_job", replace_existing=True)
+    scheduler.start()
+    logger.info("Scheduler started with post(35m), comment(15m), reply(10m), upvote(20m) jobs")
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down scheduler...")
+    scheduler.shutdown()
+
 
 app = FastAPI(
     title="Azoni Moltbook Agent",
     description="API for controlling the Azoni Moltbook agent",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # CORS for admin panel
