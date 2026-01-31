@@ -23,7 +23,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from agent import run_agent, get_moltbook_client
-from agent.tools import MoltbookClient
+from agent.tools import MoltbookClient, MoltbookAPIError, get_circuit_status
 from config.settings import settings
 from config.firebase import get_firestore, MOLTBOOK_CONFIG, MOLTBOOK_ACTIVITY, MOLTBOOK_STATE, MOLTBOOK_JOB_HISTORY
 
@@ -216,6 +216,11 @@ def _fallback_post(topic: str) -> dict:
     client = get_moltbook_client()
     db = get_firestore()
     
+    # Check circuit breaker before even trying
+    circuit = get_circuit_status()
+    if circuit["is_open"]:
+        raise MoltbookAPIError(f"Moltbook API unavailable (circuit breaker open, {circuit['consecutive_failures']} failures)")
+    
     llm = ChatOpenAI(
         model=settings.default_model.split("/")[-1],
         openai_api_key=settings.openrouter_api_key,
@@ -282,6 +287,11 @@ def _fallback_comment() -> dict:
     client = get_moltbook_client()
     db = get_firestore()
     
+    # Check circuit breaker before even trying
+    circuit = get_circuit_status()
+    if circuit["is_open"]:
+        return {"error": f"Moltbook API unavailable (circuit breaker open, {circuit['consecutive_failures']} failures)"}
+    
     llm = ChatOpenAI(
         model=settings.default_model.split("/")[-1],
         openai_api_key=settings.openrouter_api_key,
@@ -290,9 +300,17 @@ def _fallback_comment() -> dict:
         default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
     )
     
-    # Get feed
-    feed = client.get_feed(sort="hot", limit=15)
-    new_posts = client.get_feed(sort="new", limit=10)
+    # Get feed - handle API errors gracefully
+    try:
+        feed = client.get_feed(sort="hot", limit=15)
+    except MoltbookAPIError as e:
+        return {"error": f"Moltbook API error fetching feed: {e}"}
+    
+    try:
+        new_posts = client.get_feed(sort="new", limit=10)
+    except MoltbookAPIError:
+        new_posts = []  # Non-critical, continue with hot feed only
+    
     seen_ids = set()
     all_posts = []
     for post in feed + new_posts:
@@ -375,6 +393,13 @@ def post_job():
         log_job("post", "skipped", {"reason": "cooldown active"})
         return
     
+    # Pre-check: is Moltbook even reachable?
+    circuit = get_circuit_status()
+    if circuit["is_open"]:
+        logger.warning(f"Post job skipped: Moltbook API circuit breaker open ({circuit['consecutive_failures']} failures)")
+        log_job("post", "skipped", {"reason": f"Moltbook API down (circuit breaker, {circuit['consecutive_failures']} failures)"})
+        return
+    
     topic = get_next_post_topic()
     logger.info(f"Post topic: {topic}")
     
@@ -424,8 +449,19 @@ def post_job():
         })
         logger.info(f"Post job fallback SUCCESS: {direct_result}")
         
+    except MoltbookAPIError as e:
+        # Moltbook is down - log cleanly
+        logger.warning(f"Post job: Moltbook API error: {e}")
+        log_job("post", "skipped", {"reason": f"Moltbook API: {str(e)[:120]}"})
+        
     except Exception as e:
         logger.error(f"Post job LangGraph exception: {e}")
+        
+        # Only try fallback if it wasn't a Moltbook/timeout error
+        if isinstance(e, MoltbookAPIError) or "timeout" in str(e).lower():
+            logger.warning("Post job: Skipping fallback (API appears unreachable)")
+            log_job("post", "skipped", {"reason": f"API unreachable: {str(e)[:100]}"})
+            return
         
         # Fallback to direct
         try:
@@ -439,8 +475,6 @@ def post_job():
             logger.info(f"Post job fallback SUCCESS: {direct_result}")
         except Exception as e2:
             logger.error(f"Post job direct fallback also FAILED: {e2}")
-            import traceback
-            traceback.print_exc()
             log_job("post", "failed", {
                 "langgraph_error": str(e)[:100],
                 "direct_error": str(e2)[:100]
@@ -454,6 +488,13 @@ def comment_job():
     if not check_autonomous_mode():
         logger.info("Autonomous mode disabled, skipping comment")
         log_job("comment", "skipped", {"reason": "autonomous mode off"})
+        return
+    
+    # Pre-check: is Moltbook even reachable?
+    circuit = get_circuit_status()
+    if circuit["is_open"]:
+        logger.warning(f"Comment job skipped: Moltbook API circuit breaker open ({circuit['consecutive_failures']} failures)")
+        log_job("comment", "skipped", {"reason": f"Moltbook API down (circuit breaker, {circuit['consecutive_failures']} failures)"})
         return
     
     # Try LangGraph first
@@ -507,8 +548,19 @@ def comment_job():
             })
         logger.info(f"Comment job fallback: {direct_result}")
         
+    except MoltbookAPIError as e:
+        # Moltbook is down - log cleanly, don't spam tracebacks
+        logger.warning(f"Comment job: Moltbook API error: {e}")
+        log_job("comment", "skipped", {"reason": f"Moltbook API: {str(e)[:120]}"})
+        
     except Exception as e:
         logger.error(f"Comment job LangGraph exception: {e}")
+        
+        # Only try fallback if it wasn't a Moltbook API error (avoid double-timeout)
+        if isinstance(e, MoltbookAPIError) or "timeout" in str(e).lower():
+            logger.warning("Comment job: Skipping fallback (API appears unreachable)")
+            log_job("comment", "skipped", {"reason": f"API unreachable: {str(e)[:100]}"})
+            return
         
         try:
             logger.info("Comment job: Falling back to direct after exception...")
@@ -523,8 +575,6 @@ def comment_job():
             logger.info(f"Comment job fallback: {direct_result}")
         except Exception as e2:
             logger.error(f"Comment job direct fallback also FAILED: {e2}")
-            import traceback
-            traceback.print_exc()
             log_job("comment", "failed", {
                 "langgraph_error": str(e)[:100],
                 "direct_error": str(e2)[:100]
@@ -536,6 +586,13 @@ def reply_job():
     logger.info(f"Reply job triggered at {datetime.now()}")
     
     if not check_autonomous_mode():
+        return
+    
+    # Pre-check: is Moltbook even reachable?
+    circuit = get_circuit_status()
+    if circuit["is_open"]:
+        logger.warning(f"Reply job skipped: Moltbook API circuit breaker open")
+        log_job("reply", "skipped", {"reason": f"Moltbook API down (circuit breaker)"})
         return
     
     try:
@@ -552,7 +609,7 @@ def reply_job():
             openai_api_key=settings.openrouter_api_key,
             openai_api_base="https://openrouter.ai/api/v1",
             request_timeout=60,
-        default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
+            default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
         )
         
         # Get our recent posts
@@ -643,6 +700,10 @@ Keep it short (1-3 sentences). Be genuine.'''
             "replies_made": replies_made,
             "posts_checked": len(our_posts)
         })
+    
+    except MoltbookAPIError as e:
+        logger.warning(f"Reply job: Moltbook API error: {e}")
+        log_job("reply", "skipped", {"reason": f"Moltbook API: {str(e)[:100]}"})
                 
     except Exception as e:
         logger.error(f"Reply job failed: {e}")
@@ -654,6 +715,13 @@ def new_post_watcher():
     logger.info(f"New post watcher triggered at {datetime.now()}")
     
     if not check_autonomous_mode():
+        return
+    
+    # Pre-check: is Moltbook even reachable?
+    circuit = get_circuit_status()
+    if circuit["is_open"]:
+        logger.warning(f"Watcher skipped: Moltbook API circuit breaker open")
+        log_job("watcher", "skipped", {"reason": "Moltbook API down (circuit breaker)"})
         return
     
     try:
@@ -670,7 +738,7 @@ def new_post_watcher():
             openai_api_key=settings.openrouter_api_key,
             openai_api_base="https://openrouter.ai/api/v1",
             request_timeout=60,
-        default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
+            default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
         )
         
         # Get newest posts
@@ -748,6 +816,10 @@ Just write the comment text directly, no labels."""
             "posts_checked": len(new_posts),
             "reason": "" if commented > 0 else "no new uncommented posts"
         })
+    
+    except MoltbookAPIError as e:
+        logger.warning(f"New post watcher: Moltbook API error: {e}")
+        log_job("watcher", "skipped", {"reason": f"Moltbook API: {str(e)[:100]}"})
             
     except Exception as e:
         logger.error(f"New post watcher failed: {e}")
@@ -866,7 +938,7 @@ def startup_check():
             openai_api_key=settings.openrouter_api_key,
             openai_api_base="https://openrouter.ai/api/v1",
             request_timeout=60,
-        default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
+            default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
         )
         resp = llm.invoke([HumanMessage(content="Say 'ok' in one word.")])
         logger.info(f"  LLM (OpenRouter): OK - {resp.content[:20]}")
@@ -1791,7 +1863,8 @@ async def get_status():
         "last_activity": state_data.get("last_activity"),
         "posts_today": len(posts_today),
         "scheduler_running": scheduler.running,
-        "scheduler_jobs": scheduler_jobs
+        "scheduler_jobs": scheduler_jobs,
+        "circuit_breaker": get_circuit_status()
     }
 
 
