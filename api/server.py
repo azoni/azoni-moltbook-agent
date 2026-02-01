@@ -2327,21 +2327,33 @@ async def update_config(request: ConfigUpdate):
     if request.intervals is not None:
         update_data["intervals"] = request.intervals
     
+    firestore_ok = False
     if update_data:
         update_data["updated_at"] = datetime.now()
         def _do_update():
             db = get_firestore()
             db.collection(MOLTBOOK_CONFIG).document("settings").set(update_data, merge=True)
         result = fs_call(_do_update, fallback="failed", op="writes", count=1)
-        if result == "failed":
-            raise HTTPException(status_code=503, detail="Firestore unavailable")
-        _config_cache["expires_at"] = 0
+        if result != "failed":
+            firestore_ok = True
+            _config_cache["expires_at"] = 0
+        
+        # Always update in-memory cache so settings take effect immediately
+        if _config_cache["data"] is None:
+            _config_cache["data"] = {}
+        _config_cache["data"].update(update_data)
+        _config_cache["expires_at"] = time.time() + _CONFIG_CACHE_TTL
     
     # Reschedule if intervals changed
     if request.intervals is not None:
         reschedule_jobs()
     
-    return {"success": True, "updated": update_data}
+    return {
+        "success": True,
+        "updated": update_data,
+        "persisted": firestore_ok,
+        "note": None if firestore_ok else "Applied in-memory only — will persist when Firestore recovers"
+    }
 
 
 @app.get("/config")
