@@ -28,6 +28,8 @@ from agent.tools import MoltbookClient, MoltbookAPIError, get_circuit_status
 from config.settings import settings
 from config.firebase import get_firestore, MOLTBOOK_CONFIG, MOLTBOOK_ACTIVITY, MOLTBOOK_STATE, MOLTBOOK_JOB_HISTORY
 
+import threading
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,18 @@ scheduler = AsyncIOScheduler()
 # Cache Moltbook status for 30s to prevent hammering on dashboard load
 _status_cache = {"data": None, "timestamp": 0}
 STATUS_CACHE_TTL = 30  # seconds
+
+# ===== Firestore caching layer =====
+# Prevents hammering Firestore on every job tick (free tier = 50k reads/day)
+_FIRESTORE_TIMEOUT = 10  # seconds — fail fast instead of 300s default
+
+# Config cache: autonomous mode, intervals, topics, etc.
+_config_cache = {"data": None, "expires_at": 0}
+_CONFIG_CACHE_TTL = 60  # re-read config from Firestore at most once per minute
+
+# Job history: buffer in memory, flush periodically
+_job_history_buffer = []
+_job_history_lock = threading.Lock()
 
 def _get_cached_moltbook_status():
     """Get Moltbook status with 30s cache - uses fast no-retry path."""
@@ -81,15 +95,36 @@ JOB_FUNCTIONS = {
 }
 
 
-def get_intervals() -> dict:
-    """Get job intervals from Firestore config, with defaults."""
+def _refresh_config_cache():
+    """Fetch full config from Firestore with short timeout, update cache."""
     try:
         db = get_firestore()
-        config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
+        config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get(timeout=_FIRESTORE_TIMEOUT)
         if config_doc.exists:
-            stored = config_doc.to_dict().get("intervals", {})
-            merged = {**DEFAULT_INTERVALS, **stored}
-            return merged
+            data = config_doc.to_dict()
+            _config_cache["data"] = data
+            _config_cache["expires_at"] = time.time() + _CONFIG_CACHE_TTL
+            return data
+    except Exception as e:
+        logger.warning(f"Config cache refresh failed: {e}")
+    return _config_cache["data"]  # return stale data if available
+
+
+def _get_config() -> dict:
+    """Get config dict, from cache or Firestore."""
+    if _config_cache["data"] is not None and time.time() < _config_cache["expires_at"]:
+        return _config_cache["data"]
+    result = _refresh_config_cache()
+    return result or {}
+
+
+def get_intervals() -> dict:
+    """Get job intervals from cached config, with defaults."""
+    try:
+        config = _get_config()
+        if config:
+            stored = config.get("intervals", {})
+            return {**DEFAULT_INTERVALS, **stored}
     except:
         pass
     return DEFAULT_INTERVALS.copy()
@@ -133,16 +168,11 @@ def reschedule_jobs():
 # ==================== Scheduler Jobs ====================
 
 def check_autonomous_mode() -> bool:
-    """Check if autonomous mode is enabled."""
+    """Check if autonomous mode is enabled. Uses cached config (60s TTL)."""
     try:
-        db = get_firestore()
-        config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
-        if config_doc.exists:
-            mode = config_doc.to_dict().get("autonomous_mode", False)
-            logger.info(f"Autonomous mode check: {mode}")
-            return mode
-        logger.warning("No config document found - autonomous mode OFF")
-        return False
+        config = _get_config()
+        mode = config.get("autonomous_mode", False) if config else False
+        return mode
     except Exception as e:
         logger.error(f"Error checking autonomous mode: {e}")
         return False
@@ -156,7 +186,7 @@ def can_post() -> bool:
             .where("action", "==", "post")
             .order_by("timestamp", direction="DESCENDING")
             .limit(1)
-            .get())
+            .get(timeout=_FIRESTORE_TIMEOUT))
         
         if not posts:
             return True
@@ -179,18 +209,22 @@ def can_post() -> bool:
 def get_next_post_topic() -> str:
     """Get and consume the next topic from the queue, or return default."""
     try:
-        db = get_firestore()
-        config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
-        config_data = config_doc.to_dict() if config_doc.exists else {}
-        topics = config_data.get("post_topics", [])
+        config = _get_config() or {}
+        topics = list(config.get("post_topics", []))
         
         if topics:
             # Pop the first topic
             next_topic = topics.pop(0)
-            # Update the queue
-            db.collection(MOLTBOOK_CONFIG).document("settings").set({
-                "post_topics": topics
-            }, merge=True)
+            # Update the queue in Firestore (with timeout)
+            try:
+                db = get_firestore()
+                db.collection(MOLTBOOK_CONFIG).document("settings").set({
+                    "post_topics": topics
+                }, merge=True, timeout=_FIRESTORE_TIMEOUT)
+                # Invalidate cache so next read sees updated topics
+                _config_cache["expires_at"] = 0
+            except Exception as e:
+                logger.warning(f"Failed to update topic queue in Firestore: {e}")
             return next_topic
         
         # Default topics if queue is empty
@@ -209,26 +243,54 @@ def get_next_post_topic() -> str:
 
 
 def log_job(job_name: str, status: str, details: dict):
-    """Log job execution to Firestore job history. Keeps only last 50."""
+    """Buffer job history in memory. Flushed to Firestore every 5 minutes."""
+    entry = {
+        "job": job_name,
+        "status": status,
+        "timestamp": datetime.now(),
+        "details": details
+    }
+    with _job_history_lock:
+        _job_history_buffer.append(entry)
+        # Keep buffer from growing unbounded (max 100 entries)
+        if len(_job_history_buffer) > 100:
+            _job_history_buffer[:] = _job_history_buffer[-100:]
+    logger.info(f"Job logged (buffered): {job_name} → {status}")
+
+
+def flush_job_history():
+    """Flush buffered job history to Firestore. Runs as scheduled job."""
+    with _job_history_lock:
+        if not _job_history_buffer:
+            return
+        entries = list(_job_history_buffer)
+        _job_history_buffer.clear()
+
     try:
         db = get_firestore()
-        db.collection(MOLTBOOK_JOB_HISTORY).add({
-            "job": job_name,
-            "status": status,  # "success", "fallback_success", "failed", "skipped"
-            "timestamp": datetime.now(),
-            "details": details
-        })
-        
-        # Cleanup: delete old entries beyond 50
-        old_docs = list(db.collection(MOLTBOOK_JOB_HISTORY)
-            .order_by("timestamp", direction="DESCENDING")
-            .offset(50)
-            .limit(20)
-            .get())
-        for doc in old_docs:
-            doc.reference.delete()
+        batch = db.batch()
+        for entry in entries:
+            ref = db.collection(MOLTBOOK_JOB_HISTORY).document()
+            batch.set(ref, entry)
+        batch.commit(timeout=_FIRESTORE_TIMEOUT)
+        logger.info(f"Flushed {len(entries)} job history entries to Firestore")
+
+        # Cleanup old entries (only during flush, not every write)
+        try:
+            old_docs = list(db.collection(MOLTBOOK_JOB_HISTORY)
+                .order_by("timestamp", direction="DESCENDING")
+                .offset(50)
+                .limit(20)
+                .get(timeout=_FIRESTORE_TIMEOUT))
+            for d in old_docs:
+                d.reference.delete()
+        except Exception:
+            pass  # cleanup is best-effort
     except Exception as e:
-        logger.error(f"Failed to log job history: {e}")
+        logger.warning(f"Failed to flush job history ({len(entries)} entries): {e}")
+        # Put entries back so they'll be retried next flush
+        with _job_history_lock:
+            _job_history_buffer[:0] = entries  # prepend to front
 
 
 def _fallback_post(topic: str) -> dict:
@@ -358,7 +420,7 @@ def _fallback_comment() -> dict:
         existing = list(db.collection(MOLTBOOK_ACTIVITY)
             .where("action", "==", "comment")
             .where("decision.target_post_id", "==", post.get("id"))
-            .limit(1).get())
+            .limit(1).get(timeout=_FIRESTORE_TIMEOUT))
         if not existing:
             target = post
             break
@@ -641,7 +703,7 @@ def reply_job():
             .where("action", "==", "post")
             .order_by("timestamp", direction="DESCENDING")
             .limit(5)
-            .get())
+            .get(timeout=_FIRESTORE_TIMEOUT))
         
         replies_made = 0
         max_replies_per_run = 5  # Limit to avoid rate limits
@@ -680,7 +742,7 @@ def reply_job():
                         .where("action", "==", "comment")
                         .where("decision.target_comment_id", "==", comment_id)
                         .limit(1)
-                        .get())
+                        .get(timeout=_FIRESTORE_TIMEOUT))
                     
                     if existing:
                         continue
@@ -788,7 +850,7 @@ def new_post_watcher():
             existing = list(db.collection(MOLTBOOK_ACTIVITY)
                 .where("action", "==", "comment")
                 .where("decision.target_post_id", "==", post_id)
-                .limit(1).get())
+                .limit(1).get(timeout=_FIRESTORE_TIMEOUT))
             
             if existing:
                 continue
@@ -875,7 +937,7 @@ def upvote_job():
                 .where("action", "==", "upvote")
                 .where("decision.target_post_id", "==", post_id)
                 .limit(1)
-                .get())
+                .get(timeout=_FIRESTORE_TIMEOUT))
             
             if existing:
                 continue
@@ -930,7 +992,7 @@ def startup_check():
     # Check Firestore
     try:
         db = get_firestore()
-        config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
+        config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get(timeout=_FIRESTORE_TIMEOUT)
         if config_doc.exists:
             config = config_doc.to_dict()
             logger.info(f"  Firestore: OK")
@@ -985,6 +1047,9 @@ async def lifespan(app: FastAPI):
     # Use dynamic intervals from Firestore
     reschedule_jobs()
     
+    # Flush job history buffer to Firestore every 5 minutes
+    scheduler.add_job(flush_job_history, IntervalTrigger(minutes=5), id="flush_job_history", replace_existing=True)
+    
     # Run health check 10 seconds after startup
     from apscheduler.triggers.date import DateTrigger
     scheduler.add_job(startup_check, DateTrigger(run_date=datetime.now() + timedelta(seconds=10)), id="startup_check")
@@ -995,8 +1060,9 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Shutdown
+    # Shutdown — flush any remaining job history
     logger.info("Shutting down scheduler...")
+    flush_job_history()
     scheduler.shutdown()
 
 
@@ -1060,7 +1126,7 @@ async def root():
         
         # Get config (with fallback)
         try:
-            config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
+            config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get(timeout=_FIRESTORE_TIMEOUT)
             config_data = config_doc.to_dict() if config_doc.exists else {}
         except:
             config_data = {}
@@ -1086,7 +1152,7 @@ async def root():
         try:
             activity_docs = db.collection(MOLTBOOK_ACTIVITY)\
                 .order_by("timestamp", direction="DESCENDING")\
-                .limit(10).get()
+                .limit(10).get(timeout=_FIRESTORE_TIMEOUT)
             
             for doc in activity_docs:
                 data = doc.to_dict()
@@ -1157,15 +1223,15 @@ async def root():
             posts_today = len(list(db.collection(MOLTBOOK_ACTIVITY)
                 .where("action", "==", "post")
                 .where("date", "==", today)
-                .limit(50).get()))
+                .limit(50).get(timeout=_FIRESTORE_TIMEOUT)))
             comments_today = len(list(db.collection(MOLTBOOK_ACTIVITY)
                 .where("action", "==", "comment")
                 .where("date", "==", today)
-                .limit(50).get()))
+                .limit(50).get(timeout=_FIRESTORE_TIMEOUT)))
             upvotes_today = len(list(db.collection(MOLTBOOK_ACTIVITY)
                 .where("action", "==", "upvote")
                 .where("date", "==", today)
-                .limit(50).get()))
+                .limit(50).get(timeout=_FIRESTORE_TIMEOUT)))
         except:
             pass
         
@@ -1301,7 +1367,7 @@ async def root():
         try:
             job_docs = db.collection(MOLTBOOK_JOB_HISTORY)\
                 .order_by("timestamp", direction="DESCENDING")\
-                .limit(15).get()
+                .limit(15).get(timeout=_FIRESTORE_TIMEOUT)
             
             for doc in job_docs:
                 data = doc.to_dict()
@@ -1841,11 +1907,11 @@ async def get_status():
     db = get_firestore()
     
     # Get state
-    state_doc = db.collection(MOLTBOOK_STATE).document("agent").get()
+    state_doc = db.collection(MOLTBOOK_STATE).document("agent").get(timeout=_FIRESTORE_TIMEOUT)
     state_data = state_doc.to_dict() if state_doc.exists else {}
     
     # Get config
-    config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
+    config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get(timeout=_FIRESTORE_TIMEOUT)
     config_data = config_doc.to_dict() if config_doc.exists else {}
     
     # Check if registered with Moltbook
@@ -1864,7 +1930,7 @@ async def get_status():
     posts_today = list(db.collection(MOLTBOOK_ACTIVITY)
         .where("action", "==", "post")
         .where("date", "==", today)
-        .limit(10).get())
+        .limit(10).get(timeout=_FIRESTORE_TIMEOUT))
     
     # Get scheduler info
     scheduler_jobs = []
@@ -2083,7 +2149,9 @@ async def update_config(request: ConfigUpdate):
     
     if update_data:
         update_data["updated_at"] = datetime.now()
-        db.collection(MOLTBOOK_CONFIG).document("settings").set(update_data, merge=True)
+        db.collection(MOLTBOOK_CONFIG).document("settings").set(update_data, merge=True, timeout=_FIRESTORE_TIMEOUT)
+        # Invalidate config cache so next read sees fresh data
+        _config_cache["expires_at"] = 0
     
     # Reschedule if intervals changed
     if request.intervals is not None:
@@ -2097,7 +2165,7 @@ async def get_config():
     """Get current configuration."""
     db = get_firestore()
     
-    config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
+    config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get(timeout=_FIRESTORE_TIMEOUT)
     config_data = config_doc.to_dict() if config_doc.exists else {}
     
     return {
@@ -2114,7 +2182,7 @@ async def get_config():
 async def get_topics():
     """Get the post topics queue."""
     db = get_firestore()
-    config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
+    config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get(timeout=_FIRESTORE_TIMEOUT)
     config_data = config_doc.to_dict() if config_doc.exists else {}
     return {"topics": config_data.get("post_topics", [])}
 
@@ -2134,7 +2202,7 @@ async def add_topic(topic: str):
 async def remove_topic(index: int):
     """Remove a topic by index (0-based)."""
     db = get_firestore()
-    config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
+    config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get(timeout=_FIRESTORE_TIMEOUT)
     config_data = config_doc.to_dict() if config_doc.exists else {}
     topics = config_data.get("post_topics", [])
     
@@ -2164,16 +2232,18 @@ async def get_profile():
 
 @app.get("/jobs")
 async def get_job_history():
-    """Get recent job execution history."""
-    db = get_firestore()
+    """Get recent job execution history (Firestore + in-memory buffer)."""
+    jobs = []
+    
+    # First, get any persisted entries from Firestore
     try:
+        db = get_firestore()
         docs = list(db.collection(MOLTBOOK_JOB_HISTORY)
             .order_by("timestamp", direction="DESCENDING")
-            .limit(20).get())
+            .limit(20).get(timeout=_FIRESTORE_TIMEOUT))
         
-        jobs = []
-        for doc in docs:
-            data = doc.to_dict()
+        for d in docs:
+            data = d.to_dict()
             ts = data.get("timestamp")
             jobs.append({
                 "job": data.get("job"),
@@ -2181,9 +2251,23 @@ async def get_job_history():
                 "timestamp": ts.isoformat() if ts else None,
                 "details": data.get("details", {})
             })
-        return {"jobs": jobs}
     except Exception as e:
-        return {"error": str(e)}
+        logger.warning(f"Failed to read job history from Firestore: {e}")
+    
+    # Then merge in buffered (not-yet-flushed) entries
+    with _job_history_lock:
+        for entry in reversed(_job_history_buffer):
+            ts = entry.get("timestamp")
+            jobs.append({
+                "job": entry.get("job"),
+                "status": entry.get("status"),
+                "timestamp": ts.isoformat() if ts else None,
+                "details": entry.get("details", {})
+            })
+    
+    # Sort by timestamp descending and limit
+    jobs.sort(key=lambda x: x.get("timestamp") or "", reverse=True)
+    return {"jobs": jobs[:30]}
 
 
 @app.post("/debug/comment", dependencies=[Depends(require_admin)])
