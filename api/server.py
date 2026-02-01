@@ -29,6 +29,7 @@ from config.settings import settings
 from config.firebase import get_firestore, MOLTBOOK_CONFIG, MOLTBOOK_ACTIVITY, MOLTBOOK_STATE, MOLTBOOK_JOB_HISTORY
 
 import threading
+import concurrent.futures
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,9 +41,107 @@ scheduler = AsyncIOScheduler()
 _status_cache = {"data": None, "timestamp": 0}
 STATUS_CACHE_TTL = 30  # seconds
 
-# ===== Firestore caching layer =====
-# Prevents hammering Firestore on every job tick (free tier = 50k reads/day)
-_FIRESTORE_TIMEOUT = 10  # seconds — fail fast instead of 300s default
+# ===== Firestore hard timeout wrapper =====
+# Firestore's built-in retry/timeout params DO NOT reliably prevent 300s hangs
+# on 429 quota errors. This wrapper kills the call at the Python thread level.
+_FS_TIMEOUT = 8  # seconds — hard kill for any Firestore call
+_fs_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="fs")
+_firestore_down = False  # Track if Firestore is known-down
+
+# ===== Firestore usage tracking =====
+# Free tier daily limits: 50k reads, 20k writes, 20k deletes
+_FIRESTORE_LIMITS = {"reads": 50000, "writes": 20000, "deletes": 20000}
+_fs_usage = {"reads": 0, "writes": 0, "deletes": 0, "errors": 0, "timeouts": 0, "reset_date": None}
+_fs_usage_lock = threading.Lock()
+
+
+def _fs_track(op_type: str, count: int = 1):
+    """Track a Firestore operation. op_type: 'reads', 'writes', or 'deletes'."""
+    with _fs_usage_lock:
+        today = datetime.now().date().isoformat()
+        if _fs_usage["reset_date"] != today:
+            _fs_usage["reads"] = 0
+            _fs_usage["writes"] = 0
+            _fs_usage["deletes"] = 0
+            _fs_usage["errors"] = 0
+            _fs_usage["timeouts"] = 0
+            _fs_usage["reset_date"] = today
+        _fs_usage[op_type] = _fs_usage.get(op_type, 0) + count
+
+
+def get_fs_usage() -> dict:
+    """Get current Firestore usage stats with remaining quota."""
+    with _fs_usage_lock:
+        today = datetime.now().date().isoformat()
+        if _fs_usage["reset_date"] != today:
+            return {
+                "reads": 0, "writes": 0, "deletes": 0, "errors": 0, "timeouts": 0,
+                "limits": _FIRESTORE_LIMITS,
+                "remaining": dict(_FIRESTORE_LIMITS),
+                "pct_used": {"reads": 0, "writes": 0, "deletes": 0},
+                "reset_date": today,
+                "firestore_down": _firestore_down
+            }
+        remaining = {
+            "reads": max(0, _FIRESTORE_LIMITS["reads"] - _fs_usage["reads"]),
+            "writes": max(0, _FIRESTORE_LIMITS["writes"] - _fs_usage["writes"]),
+            "deletes": max(0, _FIRESTORE_LIMITS["deletes"] - _fs_usage["deletes"]),
+        }
+        pct = {
+            "reads": round(_fs_usage["reads"] / _FIRESTORE_LIMITS["reads"] * 100, 1),
+            "writes": round(_fs_usage["writes"] / _FIRESTORE_LIMITS["writes"] * 100, 1),
+            "deletes": round(_fs_usage["deletes"] / _FIRESTORE_LIMITS["deletes"] * 100, 1),
+        }
+        return {
+            "reads": _fs_usage["reads"],
+            "writes": _fs_usage["writes"],
+            "deletes": _fs_usage["deletes"],
+            "errors": _fs_usage["errors"],
+            "timeouts": _fs_usage["timeouts"],
+            "limits": _FIRESTORE_LIMITS,
+            "remaining": remaining,
+            "pct_used": pct,
+            "reset_date": _fs_usage["reset_date"],
+            "firestore_down": _firestore_down
+        }
+
+
+def fs_call(fn, fallback=None, op="reads", count=1):
+    """Execute a Firestore callable with a hard Python-level timeout.
+    Tracks usage by op type ('reads', 'writes', 'deletes').
+    Returns fallback value if the call fails or times out."""
+    global _firestore_down
+    if _firestore_down:
+        return fallback
+    try:
+        future = _fs_executor.submit(fn)
+        result = future.result(timeout=_FS_TIMEOUT)
+        _firestore_down = False  # It worked, mark as up
+        _fs_track(op, count)
+        return result
+    except concurrent.futures.TimeoutError:
+        logger.warning(f"Firestore call timed out after {_FS_TIMEOUT}s (hard kill)")
+        _firestore_down = True
+        _fs_track("timeouts")
+        return fallback
+    except Exception as e:
+        err_str = str(e)
+        _fs_track("errors")
+        if "429" in err_str or "Quota" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+            logger.warning(f"Firestore quota exceeded — disabling for 5 min")
+            _firestore_down = True
+            # Schedule re-enable
+            threading.Timer(300, _re_enable_firestore).start()
+        else:
+            logger.warning(f"Firestore call failed: {e}")
+        return fallback
+
+
+def _re_enable_firestore():
+    global _firestore_down
+    logger.info("Re-enabling Firestore calls (cooldown expired)")
+    _firestore_down = False
+
 
 # Config cache: autonomous mode, intervals, topics, etc.
 _config_cache = {"data": None, "expires_at": 0}
@@ -96,18 +195,18 @@ JOB_FUNCTIONS = {
 
 
 def _refresh_config_cache():
-    """Fetch full config from Firestore with short timeout, update cache."""
-    try:
+    """Fetch full config from Firestore with hard timeout, update cache."""
+    def _do():
         db = get_firestore()
-        config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get(timeout=_FIRESTORE_TIMEOUT)
-        if config_doc.exists:
-            data = config_doc.to_dict()
-            _config_cache["data"] = data
-            _config_cache["expires_at"] = time.time() + _CONFIG_CACHE_TTL
-            return data
-    except Exception as e:
-        logger.warning(f"Config cache refresh failed: {e}")
-    return _config_cache["data"]  # return stale data if available
+        doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
+        return doc.to_dict() if doc.exists else {}
+
+    data = fs_call(_do, fallback=None, op="reads", count=1)
+    if data is not None:
+        _config_cache["data"] = data
+        _config_cache["expires_at"] = time.time() + _CONFIG_CACHE_TTL
+        return data
+    return _config_cache["data"]  # return stale cache if available
 
 
 def _get_config() -> dict:
@@ -180,13 +279,13 @@ def check_autonomous_mode() -> bool:
 
 def can_post() -> bool:
     """Check if we can post (30 min cooldown)."""
-    try:
+    def _do():
         db = get_firestore()
         posts = list(db.collection(MOLTBOOK_ACTIVITY)
             .where("action", "==", "post")
             .order_by("timestamp", direction="DESCENDING")
             .limit(1)
-            .get(timeout=_FIRESTORE_TIMEOUT))
+            .get())
         
         if not posts:
             return True
@@ -201,9 +300,9 @@ def can_post() -> bool:
             time_since = datetime.now() - last_post_time.replace(tzinfo=None)
             return time_since > timedelta(minutes=30)
         return True
-    except Exception as e:
-        logger.error(f"Error checking post cooldown: {e}")
-        return False
+
+    result = fs_call(_do, fallback=True, op="reads", count=1)
+    return result
 
 
 def get_next_post_topic() -> str:
@@ -215,16 +314,14 @@ def get_next_post_topic() -> str:
         if topics:
             # Pop the first topic
             next_topic = topics.pop(0)
-            # Update the queue in Firestore (with timeout)
-            try:
+            # Update the queue in Firestore
+            def _update_topics():
                 db = get_firestore()
                 db.collection(MOLTBOOK_CONFIG).document("settings").set({
                     "post_topics": topics
-                }, merge=True, timeout=_FIRESTORE_TIMEOUT)
-                # Invalidate cache so next read sees updated topics
-                _config_cache["expires_at"] = 0
-            except Exception as e:
-                logger.warning(f"Failed to update topic queue in Firestore: {e}")
+                }, merge=True)
+            fs_call(_update_topics, fallback=None, op="writes", count=1)
+            _config_cache["expires_at"] = 0
             return next_topic
         
         # Default topics if queue is empty
@@ -243,7 +340,8 @@ def get_next_post_topic() -> str:
 
 
 def log_job(job_name: str, status: str, details: dict):
-    """Buffer job history in memory. Flushed to Firestore every 5 minutes."""
+    """Buffer job history in memory. Flushed to Firestore every 5 minutes.
+    Also tracks estimated Firestore operations per job run."""
     entry = {
         "job": job_name,
         "status": status,
@@ -256,6 +354,25 @@ def log_job(job_name: str, status: str, details: dict):
         if len(_job_history_buffer) > 100:
             _job_history_buffer[:] = _job_history_buffer[-100:]
     logger.info(f"Job logged (buffered): {job_name} → {status}")
+    
+    # Track estimated Firestore ops for background jobs
+    # (These calls happen outside fs_call so we estimate them)
+    if status == "skipped":
+        pass  # no Firestore ops for skipped jobs (check_autonomous uses cache)
+    elif status in ("success", "fallback_success"):
+        # Estimated reads/writes per successful job
+        ops = {
+            "post": {"reads": 2, "writes": 1},      # can_post check + activity write
+            "comment": {"reads": 3, "writes": 1},    # feed read + existing check + activity write
+            "reply": {"reads": 5, "writes": 2},      # posts read + comments read + existing checks + writes
+            "upvote": {"reads": 4, "writes": 2},     # feed read + existing checks + activity writes
+            "watcher": {"reads": 4, "writes": 2},    # new posts + existing checks + activity writes
+        }
+        est = ops.get(job_name, {"reads": 1, "writes": 1})
+        _fs_track("reads", est["reads"])
+        _fs_track("writes", est["writes"])
+    elif status == "failed":
+        _fs_track("reads", 1)  # at least the initial check
 
 
 def flush_job_history():
@@ -266,29 +383,20 @@ def flush_job_history():
         entries = list(_job_history_buffer)
         _job_history_buffer.clear()
 
-    try:
+    def _do_flush():
         db = get_firestore()
         batch = db.batch()
         for entry in entries:
             ref = db.collection(MOLTBOOK_JOB_HISTORY).document()
             batch.set(ref, entry)
-        batch.commit(timeout=_FIRESTORE_TIMEOUT)
-        logger.info(f"Flushed {len(entries)} job history entries to Firestore")
+        batch.commit()
+        return len(entries)
 
-        # Cleanup old entries (only during flush, not every write)
-        try:
-            old_docs = list(db.collection(MOLTBOOK_JOB_HISTORY)
-                .order_by("timestamp", direction="DESCENDING")
-                .offset(50)
-                .limit(20)
-                .get(timeout=_FIRESTORE_TIMEOUT))
-            for d in old_docs:
-                d.reference.delete()
-        except Exception:
-            pass  # cleanup is best-effort
-    except Exception as e:
-        logger.warning(f"Failed to flush job history ({len(entries)} entries): {e}")
-        # Put entries back so they'll be retried next flush
+    result = fs_call(_do_flush, fallback=None, op="writes")
+    if result is not None:
+        logger.info(f"Flushed {result} job history entries to Firestore")
+    else:
+        logger.warning(f"Failed to flush job history ({len(entries)} entries) — re-queuing")
         with _job_history_lock:
             _job_history_buffer[:0] = entries  # prepend to front
 
@@ -420,7 +528,7 @@ def _fallback_comment() -> dict:
         existing = list(db.collection(MOLTBOOK_ACTIVITY)
             .where("action", "==", "comment")
             .where("decision.target_post_id", "==", post.get("id"))
-            .limit(1).get(timeout=_FIRESTORE_TIMEOUT))
+            .limit(1).get())
         if not existing:
             target = post
             break
@@ -703,7 +811,7 @@ def reply_job():
             .where("action", "==", "post")
             .order_by("timestamp", direction="DESCENDING")
             .limit(5)
-            .get(timeout=_FIRESTORE_TIMEOUT))
+            .get())
         
         replies_made = 0
         max_replies_per_run = 5  # Limit to avoid rate limits
@@ -742,7 +850,7 @@ def reply_job():
                         .where("action", "==", "comment")
                         .where("decision.target_comment_id", "==", comment_id)
                         .limit(1)
-                        .get(timeout=_FIRESTORE_TIMEOUT))
+                        .get())
                     
                     if existing:
                         continue
@@ -850,7 +958,7 @@ def new_post_watcher():
             existing = list(db.collection(MOLTBOOK_ACTIVITY)
                 .where("action", "==", "comment")
                 .where("decision.target_post_id", "==", post_id)
-                .limit(1).get(timeout=_FIRESTORE_TIMEOUT))
+                .limit(1).get())
             
             if existing:
                 continue
@@ -937,7 +1045,7 @@ def upvote_job():
                 .where("action", "==", "upvote")
                 .where("decision.target_post_id", "==", post_id)
                 .limit(1)
-                .get(timeout=_FIRESTORE_TIMEOUT))
+                .get())
             
             if existing:
                 continue
@@ -989,23 +1097,26 @@ def startup_check():
     logger.info("STARTUP HEALTH CHECK")
     logger.info("=" * 50)
     
-    # Check Firestore
-    try:
+    # Check Firestore (with hard timeout — never blocks startup)
+    def _check_fs():
         db = get_firestore()
-        config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get(timeout=_FIRESTORE_TIMEOUT)
+        config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get()
         if config_doc.exists:
-            config = config_doc.to_dict()
-            logger.info(f"  Firestore: OK")
-            logger.info(f"  Autonomous mode: {config.get('autonomous_mode', False)}")
-            logger.info(f"  Topics in queue: {len(config.get('post_topics', []))}")
-        else:
-            logger.warning(f"  Firestore: No config doc! Creating default...")
-            db.collection(MOLTBOOK_CONFIG).document("settings").set({
-                "autonomous_mode": False,
-                "post_topics": []
-            })
-    except Exception as e:
-        logger.error(f"  Firestore: FAILED - {e}")
+            return config_doc.to_dict()
+        return None
+    
+    config = fs_call(_check_fs, fallback="timeout", op="reads", count=1)
+    if config == "timeout":
+        logger.warning("  Firestore: UNAVAILABLE (quota exceeded or timeout)")
+    elif config is None:
+        logger.warning("  Firestore: No config doc! Creating default...")
+        fs_call(lambda: get_firestore().collection(MOLTBOOK_CONFIG).document("settings").set({
+            "autonomous_mode": False, "post_topics": []
+        }), fallback=None, op="writes", count=1)
+    else:
+        logger.info(f"  Firestore: OK")
+        logger.info(f"  Autonomous mode: {config.get('autonomous_mode', False)}")
+        logger.info(f"  Topics in queue: {len(config.get('post_topics', []))}")
     
     # Check Moltbook
     try:
@@ -1122,14 +1233,11 @@ async def root():
         seattle_tz = pytz.timezone('America/Los_Angeles')
         now_seattle = datetime.now(seattle_tz)
         
-        db = get_firestore()
+        # Use cached config — never blocks on Firestore
+        config_data = _get_config() or {}
         
-        # Get config (with fallback)
-        try:
-            config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get(timeout=_FIRESTORE_TIMEOUT)
-            config_data = config_doc.to_dict() if config_doc.exists else {}
-        except:
-            config_data = {}
+        # Firestore availability flag for the rest of the dashboard
+        _fs_available = not _firestore_down
         
         # Check Moltbook connection
         moltbook_status = "Not connected"
@@ -1147,18 +1255,19 @@ async def root():
             except Exception as e:
                 moltbook_status = f"Error"
         
-        # Get recent activity (with fallback)
+        # Get recent activity (with fallback) — wrapped in hard timeout
         activities = []
-        try:
+        def _fetch_activities():
+            _activities = []
+            db = get_firestore()
             activity_docs = db.collection(MOLTBOOK_ACTIVITY)\
                 .order_by("timestamp", direction="DESCENDING")\
-                .limit(10).get(timeout=_FIRESTORE_TIMEOUT)
+                .limit(10).get()
             
             for doc in activity_docs:
                 data = doc.to_dict()
                 ts = data.get("timestamp")
                 try:
-                    # Convert to Seattle time
                     if ts:
                         if hasattr(ts, 'tzinfo') and ts.tzinfo is None:
                             ts = pytz.utc.localize(ts)
@@ -1172,7 +1281,6 @@ async def root():
                     time_str = "Unknown"
                     date_str = ""
                 
-                # Get link safely
                 post_id = None
                 result = data.get("result") or {}
                 decision = data.get("decision") or {}
@@ -1185,13 +1293,11 @@ async def root():
                     elif result.get("id"):
                         post_id = result["id"]
                 
-                # Fallback: get post_id from decision (for upvotes, comments)
                 if not post_id and isinstance(decision, dict):
                     post_id = decision.get("target_post_id")
                 
                 link = f"https://www.moltbook.com/post/{post_id}" if post_id else None
                 
-                # Get title safely - check draft, then decision reason
                 draft = data.get("draft") or {}
                 title = ""
                 if isinstance(draft, dict):
@@ -1199,10 +1305,9 @@ async def root():
                 if not title and isinstance(decision, dict):
                     title = (decision.get("reason") or "")[:50]
                 
-                # Get trigger info
                 trigger = data.get("trigger", "manual")
                 
-                activities.append({
+                _activities.append({
                     "action": data.get("action", "unknown"),
                     "time": time_str,
                     "date": date_str,
@@ -1211,29 +1316,36 @@ async def root():
                     "link": link,
                     "trigger": trigger
                 })
-        except Exception as e:
-            logger.error(f"Error fetching activity: {e}")
+            return _activities
         
-        # Count today's activity (with fallback)
+        fetched = fs_call(_fetch_activities, fallback=None, op="reads", count=10)
+        if fetched is not None:
+            activities = fetched
+        
+        # Count today's activity (with fallback) — single fs_call for all 3
         posts_today = 0
         comments_today = 0
         upvotes_today = 0
-        try:
+        def _fetch_today_counts():
+            db = get_firestore()
             today = datetime.now().date().isoformat()
-            posts_today = len(list(db.collection(MOLTBOOK_ACTIVITY)
+            p = len(list(db.collection(MOLTBOOK_ACTIVITY)
                 .where("action", "==", "post")
                 .where("date", "==", today)
-                .limit(50).get(timeout=_FIRESTORE_TIMEOUT)))
-            comments_today = len(list(db.collection(MOLTBOOK_ACTIVITY)
+                .limit(50).get()))
+            c = len(list(db.collection(MOLTBOOK_ACTIVITY)
                 .where("action", "==", "comment")
                 .where("date", "==", today)
-                .limit(50).get(timeout=_FIRESTORE_TIMEOUT)))
-            upvotes_today = len(list(db.collection(MOLTBOOK_ACTIVITY)
+                .limit(50).get()))
+            u = len(list(db.collection(MOLTBOOK_ACTIVITY)
                 .where("action", "==", "upvote")
                 .where("date", "==", today)
-                .limit(50).get(timeout=_FIRESTORE_TIMEOUT)))
-        except:
-            pass
+                .limit(50).get()))
+            return (p, c, u)
+        
+        counts = fs_call(_fetch_today_counts, fallback=None, op="reads", count=3)
+        if counts is not None:
+            posts_today, comments_today, upvotes_today = counts
         
         # Scheduler info with more details
         scheduler_status = "Running" if scheduler.running else "Stopped"
@@ -1362,12 +1474,14 @@ async def root():
                     </div>
                 </div>'''
         
-        # Get job history
+        # Get job history (merged: Firestore + in-memory buffer)
         job_history = []
-        try:
+        def _fetch_job_history():
+            _jobs = []
+            db = get_firestore()
             job_docs = db.collection(MOLTBOOK_JOB_HISTORY)\
                 .order_by("timestamp", direction="DESCENDING")\
-                .limit(15).get(timeout=_FIRESTORE_TIMEOUT)
+                .limit(15).get()
             
             for doc in job_docs:
                 data = doc.to_dict()
@@ -1384,14 +1498,38 @@ async def root():
                     time_str = "?"
                 
                 details = data.get("details", {})
-                job_history.append({
+                _jobs.append({
                     "job": data.get("job", "?"),
                     "status": data.get("status", "?"),
                     "time": time_str,
                     "details": details
                 })
-        except Exception as e:
-            logger.error(f"Error fetching job history: {e}")
+            return _jobs
+        
+        fetched_jobs = fs_call(_fetch_job_history, fallback=None, op="reads", count=15)
+        if fetched_jobs is not None:
+            job_history = fetched_jobs
+        # Also include buffered entries not yet flushed
+        with _job_history_lock:
+            for entry in reversed(_job_history_buffer[-15:]):
+                ts = entry.get("timestamp")
+                try:
+                    if ts:
+                        if hasattr(ts, 'tzinfo') and ts.tzinfo is None:
+                            ts = pytz.utc.localize(ts)
+                        ts_seattle = ts.astimezone(seattle_tz)
+                        time_str = ts_seattle.strftime("%I:%M %p")
+                    else:
+                        time_str = "?"
+                except:
+                    time_str = "?"
+                job_history.append({
+                    "job": entry.get("job", "?"),
+                    "status": entry.get("status", "?"),
+                    "time": time_str,
+                    "details": entry.get("details", {})
+                })
+        job_history = job_history[:15]
         
         # Build job history HTML
         job_history_html = ""
@@ -1427,6 +1565,37 @@ async def root():
                 '''
         else:
             job_history_html = '<div class="empty">No job history yet - jobs will log here after first run</div>'
+        
+        # Build Firestore usage HTML
+        fs_stats = get_fs_usage()
+        fs_status_class = "status-online" if not fs_stats["firestore_down"] else "status-offline"
+        fs_status_text = "Online" if not fs_stats["firestore_down"] else "DOWN (quota exceeded)"
+        
+        def _usage_bar(label, used, limit, icon):
+            pct = min(100, round(used / limit * 100, 1)) if limit > 0 else 0
+            color = "#4ade80" if pct < 60 else "#fbbf24" if pct < 85 else "#ef4444"
+            return f'''
+                <div style="margin-bottom:12px">
+                    <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+                        <span>{icon} {label}</span>
+                        <span style="color:{color};font-weight:bold">{used:,} / {limit:,} ({pct}%)</span>
+                    </div>
+                    <div style="background:rgba(255,255,255,0.1);border-radius:6px;height:10px;overflow:hidden">
+                        <div style="background:{color};width:{pct}%;height:100%;border-radius:6px;transition:width 0.3s"></div>
+                    </div>
+                </div>'''
+        
+        fs_usage_html = f'''
+            <div class="status-card">
+                <div class="status-indicator {fs_status_class}" style="margin-bottom:8px">{fs_status_text}</div>
+                {_usage_bar("Reads", fs_stats["reads"], fs_stats["limits"]["reads"], "📖")}
+                {_usage_bar("Writes", fs_stats["writes"], fs_stats["limits"]["writes"], "✏️")}
+                {_usage_bar("Deletes", fs_stats["deletes"], fs_stats["limits"]["deletes"], "🗑️")}
+                <div style="margin-top:12px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.1);font-size:0.85rem;color:rgba(255,255,255,0.5)">
+                    Errors: {fs_stats["errors"]} • Timeouts: {fs_stats["timeouts"]} • Resets at midnight PT
+                    <br>⚠️ Counts since last server restart, not total daily usage
+                </div>
+            </div>'''
         
         # SVG Lobster favicon
         lobster_svg = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
@@ -1811,8 +1980,13 @@ async def root():
                     {job_history_html}
                 </div>
                 
+                <div class="section">
+                    <h2>🔥 Firestore Usage Today</h2>
+                    {fs_usage_html}
+                </div>
+                
                 <div class="footer">
-                    Auto-refreshes every 60 seconds • <a href="/status">JSON API</a> • <a href="https://www.moltbook.com/u/Azoni-AI" target="_blank">View Profile ↗</a>
+                    Auto-refreshes every 60 seconds • <a href="/status">JSON API</a> • <a href="/firestore-usage">Firestore Usage JSON</a> • <a href="https://www.moltbook.com/u/Azoni-AI" target="_blank">View Profile ↗</a>
                 </div>
             </div>
             <script>
@@ -1904,15 +2078,16 @@ async def root():
 @app.get("/status")
 async def get_status():
     """Get current agent status."""
-    db = get_firestore()
+    # Use cached config — never blocks
+    config_data = _get_config() or {}
     
-    # Get state
-    state_doc = db.collection(MOLTBOOK_STATE).document("agent").get(timeout=_FIRESTORE_TIMEOUT)
-    state_data = state_doc.to_dict() if state_doc.exists else {}
+    # Get state and today's posts via fs_call
+    def _fetch_state():
+        db = get_firestore()
+        state_doc = db.collection(MOLTBOOK_STATE).document("agent").get()
+        return state_doc.to_dict() if state_doc.exists else {}
     
-    # Get config
-    config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get(timeout=_FIRESTORE_TIMEOUT)
-    config_data = config_doc.to_dict() if config_doc.exists else {}
+    state_data = fs_call(_fetch_state, fallback={}, op="reads", count=1)
     
     # Check if registered with Moltbook
     moltbook_registered = bool(settings.moltbook_api_key)
@@ -1925,12 +2100,16 @@ async def get_status():
         except Exception as e:
             moltbook_status = f"error: {str(e)}"
     
-    # Count recent activity
-    today = datetime.now().date().isoformat()
-    posts_today = list(db.collection(MOLTBOOK_ACTIVITY)
-        .where("action", "==", "post")
-        .where("date", "==", today)
-        .limit(10).get(timeout=_FIRESTORE_TIMEOUT))
+    # Count today's posts
+    def _count_today():
+        db = get_firestore()
+        today = datetime.now().date().isoformat()
+        return len(list(db.collection(MOLTBOOK_ACTIVITY)
+            .where("action", "==", "post")
+            .where("date", "==", today)
+            .limit(10).get()))
+    
+    posts_count = fs_call(_count_today, fallback=0, op="reads", count=1)
     
     # Get scheduler info
     scheduler_jobs = []
@@ -1949,10 +2128,11 @@ async def get_status():
         "last_run": state_data.get("last_run"),
         "last_run_at": state_data.get("last_run_at"),
         "last_activity": state_data.get("last_activity"),
-        "posts_today": len(posts_today),
+        "posts_today": posts_count,
         "scheduler_running": scheduler.running,
         "scheduler_jobs": scheduler_jobs,
-        "circuit_breaker": get_circuit_status()
+        "circuit_breaker": get_circuit_status(),
+        "firestore_down": _firestore_down
     }
 
 
@@ -2114,28 +2294,28 @@ async def get_feed(sort: str = "hot", limit: int = 20):
 @app.get("/activity")
 async def get_activity(limit: int = 50):
     """Get recent agent activity."""
-    db = get_firestore()
+    def _do():
+        db = get_firestore()
+        activity_docs = db.collection(MOLTBOOK_ACTIVITY)\
+            .order_by("timestamp", direction="DESCENDING")\
+            .limit(limit)\
+            .get()
+        
+        activity = []
+        for doc in activity_docs:
+            data = doc.to_dict()
+            if data.get("timestamp"):
+                data["timestamp"] = data["timestamp"].isoformat() if hasattr(data["timestamp"], "isoformat") else str(data["timestamp"])
+            activity.append({"id": doc.id, **data})
+        return activity
     
-    activity_docs = db.collection(MOLTBOOK_ACTIVITY)\
-        .order_by("timestamp", direction="DESCENDING")\
-        .limit(limit)\
-        .get()
-    
-    activity = []
-    for doc in activity_docs:
-        data = doc.to_dict()
-        # Convert timestamp to string for JSON
-        if data.get("timestamp"):
-            data["timestamp"] = data["timestamp"].isoformat() if hasattr(data["timestamp"], "isoformat") else str(data["timestamp"])
-        activity.append({"id": doc.id, **data})
-    
-    return {"activity": activity}
+    result = fs_call(_do, fallback=[], op="reads", count=50)
+    return {"activity": result, "firestore_down": _firestore_down}
 
 
 @app.patch("/config", dependencies=[Depends(require_admin)])
 async def update_config(request: ConfigUpdate):
     """Update agent configuration."""
-    db = get_firestore()
     
     update_data = {}
     if request.autonomous_mode is not None:
@@ -2149,8 +2329,12 @@ async def update_config(request: ConfigUpdate):
     
     if update_data:
         update_data["updated_at"] = datetime.now()
-        db.collection(MOLTBOOK_CONFIG).document("settings").set(update_data, merge=True, timeout=_FIRESTORE_TIMEOUT)
-        # Invalidate config cache so next read sees fresh data
+        def _do_update():
+            db = get_firestore()
+            db.collection(MOLTBOOK_CONFIG).document("settings").set(update_data, merge=True)
+        result = fs_call(_do_update, fallback="failed", op="writes", count=1)
+        if result == "failed":
+            raise HTTPException(status_code=503, detail="Firestore unavailable")
         _config_cache["expires_at"] = 0
     
     # Reschedule if intervals changed
@@ -2163,16 +2347,14 @@ async def update_config(request: ConfigUpdate):
 @app.get("/config")
 async def get_config():
     """Get current configuration."""
-    db = get_firestore()
-    
-    config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get(timeout=_FIRESTORE_TIMEOUT)
-    config_data = config_doc.to_dict() if config_doc.exists else {}
+    config_data = _get_config() or {}
     
     return {
         "autonomous_mode": config_data.get("autonomous_mode", False),
         "max_posts_per_day": config_data.get("max_posts_per_day", 6),
         "post_topics": config_data.get("post_topics", []),
-        "intervals": {**DEFAULT_INTERVALS, **config_data.get("intervals", {})}
+        "intervals": {**DEFAULT_INTERVALS, **config_data.get("intervals", {})},
+        "firestore_down": _firestore_down
     }
 
 
@@ -2181,36 +2363,43 @@ async def get_config():
 @app.get("/topics")
 async def get_topics():
     """Get the post topics queue."""
-    db = get_firestore()
-    config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get(timeout=_FIRESTORE_TIMEOUT)
-    config_data = config_doc.to_dict() if config_doc.exists else {}
+    config_data = _get_config() or {}
     return {"topics": config_data.get("post_topics", [])}
 
 
 @app.post("/topics", dependencies=[Depends(require_admin)])
 async def add_topic(topic: str):
     """Add a topic to the queue."""
-    db = get_firestore()
-    from google.cloud.firestore import ArrayUnion
-    db.collection(MOLTBOOK_CONFIG).document("settings").set({
-        "post_topics": ArrayUnion([topic])
-    }, merge=True)
+    def _do():
+        db = get_firestore()
+        from google.cloud.firestore import ArrayUnion
+        db.collection(MOLTBOOK_CONFIG).document("settings").set({
+            "post_topics": ArrayUnion([topic])
+        }, merge=True)
+    result = fs_call(_do, fallback="failed", op="writes", count=1)
+    if result == "failed":
+        raise HTTPException(status_code=503, detail="Firestore unavailable")
+    _config_cache["expires_at"] = 0
     return {"success": True, "added": topic}
 
 
 @app.delete("/topics/{index}", dependencies=[Depends(require_admin)])
 async def remove_topic(index: int):
     """Remove a topic by index (0-based)."""
-    db = get_firestore()
-    config_doc = db.collection(MOLTBOOK_CONFIG).document("settings").get(timeout=_FIRESTORE_TIMEOUT)
-    config_data = config_doc.to_dict() if config_doc.exists else {}
-    topics = config_data.get("post_topics", [])
+    config_data = _get_config() or {}
+    topics = list(config_data.get("post_topics", []))
     
     if 0 <= index < len(topics):
         removed = topics.pop(index)
-        db.collection(MOLTBOOK_CONFIG).document("settings").set({
-            "post_topics": topics
-        }, merge=True)
+        def _do():
+            db = get_firestore()
+            db.collection(MOLTBOOK_CONFIG).document("settings").set({
+                "post_topics": topics
+            }, merge=True)
+        result = fs_call(_do, fallback="failed", op="writes", count=1)
+        if result == "failed":
+            raise HTTPException(status_code=503, detail="Firestore unavailable")
+        _config_cache["expires_at"] = 0
         return {"success": True, "removed": removed}
     else:
         raise HTTPException(status_code=404, detail="Topic index not found")
@@ -2228,6 +2417,38 @@ async def get_profile():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==================== Firestore Usage Tracking ====================
+
+@app.get("/firestore-usage")
+async def firestore_usage():
+    """Get Firestore usage stats for today (tracked since server start)."""
+    usage = get_fs_usage()
+    # Add estimated hourly rate
+    import pytz
+    pacific = pytz.timezone("America/Los_Angeles")
+    now = datetime.now(pacific)
+    hours_elapsed = now.hour + now.minute / 60.0
+    if hours_elapsed > 0.1:
+        usage["hourly_rate"] = {
+            "reads": round(usage["reads"] / hours_elapsed, 1),
+            "writes": round(usage["writes"] / hours_elapsed, 1),
+        }
+        hours_left = 24 - hours_elapsed
+        usage["projected_daily"] = {
+            "reads": round(usage["reads"] + usage["hourly_rate"]["reads"] * hours_left),
+            "writes": round(usage["writes"] + usage["hourly_rate"]["writes"] * hours_left),
+        }
+        usage["will_exceed"] = {
+            "reads": usage["projected_daily"]["reads"] > _FIRESTORE_LIMITS["reads"],
+            "writes": usage["projected_daily"]["writes"] > _FIRESTORE_LIMITS["writes"],
+        }
+    else:
+        usage["hourly_rate"] = {"reads": 0, "writes": 0}
+        usage["projected_daily"] = {"reads": 0, "writes": 0}
+        usage["will_exceed"] = {"reads": False, "writes": False}
+    return usage
+
+
 # ==================== Debug & Job History ====================
 
 @app.get("/jobs")
@@ -2235,24 +2456,26 @@ async def get_job_history():
     """Get recent job execution history (Firestore + in-memory buffer)."""
     jobs = []
     
-    # First, get any persisted entries from Firestore
-    try:
+    # First, get any persisted entries from Firestore (with hard timeout)
+    def _fetch_from_fs():
         db = get_firestore()
         docs = list(db.collection(MOLTBOOK_JOB_HISTORY)
             .order_by("timestamp", direction="DESCENDING")
-            .limit(20).get(timeout=_FIRESTORE_TIMEOUT))
-        
+            .limit(20).get())
+        result = []
         for d in docs:
             data = d.to_dict()
             ts = data.get("timestamp")
-            jobs.append({
+            result.append({
                 "job": data.get("job"),
                 "status": data.get("status"),
                 "timestamp": ts.isoformat() if ts else None,
                 "details": data.get("details", {})
             })
-    except Exception as e:
-        logger.warning(f"Failed to read job history from Firestore: {e}")
+        return result
+    
+    fs_jobs = fs_call(_fetch_from_fs, fallback=[], op="reads", count=20)
+    jobs.extend(fs_jobs)
     
     # Then merge in buffered (not-yet-flushed) entries
     with _job_history_lock:
