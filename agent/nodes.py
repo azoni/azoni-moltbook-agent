@@ -5,6 +5,8 @@ Each node is a step in the agent's workflow.
 """
 import json
 import logging
+import httpx
+import os
 from datetime import datetime, timedelta
 from typing import Dict, Any
 
@@ -27,10 +29,49 @@ from config.settings import settings
 from config.firebase import get_firestore, MOLTBOOK_ACTIVITY, MOLTBOOK_STATE
 
 
+# ==================== Activity Logging to azoni.ai ====================
+
+ACTIVITY_WEBHOOK_URL = "https://azoni.ai/.netlify/functions/log-agent-activity"
+AGENT_WEBHOOK_SECRET = os.getenv("AGENT_WEBHOOK_SECRET", "")
+
+
+def log_agent_activity_sync(
+    activity_type: str,
+    title: str,
+    description: str = "",
+    reasoning: str = "",
+    metadata: dict = None
+):
+    """Sync version of activity logging for non-async contexts."""
+    if not AGENT_WEBHOOK_SECRET:
+        logger.warning("[activity] AGENT_WEBHOOK_SECRET not set, skipping log")
+        return
+    
+    try:
+        with httpx.Client(timeout=10) as client:
+            response = client.post(
+                ACTIVITY_WEBHOOK_URL,
+                json={
+                    "type": activity_type,
+                    "title": title,
+                    "description": description,
+                    "reasoning": reasoning,
+                    "metadata": metadata or {},
+                    "secret": AGENT_WEBHOOK_SECRET
+                }
+            )
+            if response.status_code == 200:
+                logger.info(f"[activity] Logged to azoni.ai: {activity_type} - {title}")
+            else:
+                logger.warning(f"[activity] Failed to log: {response.status_code} {response.text}")
+    except Exception as e:
+        logger.error(f"[activity] Error logging to azoni.ai: {e}")
+
+
 def get_llm():
     """Get the LLM instance."""
     return ChatOpenAI(
-        model=settings.default_model.split("/")[-1],  # Extract model name
+        model=settings.default_model.split("/")[-1],
         openai_api_key=settings.openrouter_api_key,
         openai_api_base="https://openrouter.ai/api/v1",
         request_timeout=60,
@@ -44,21 +85,16 @@ def get_llm():
 # ==================== Node: Observe ====================
 
 def observe_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Observe the Moltbook feed and gather context.
-    """
+    """Observe the Moltbook feed and gather context."""
     client = get_moltbook_client()
     
     try:
-        # Fetch the feed
         feed = client.get_feed(sort="hot", limit=15)
         logger.info(f"[observe] Hot feed: {len(feed)} posts")
         
-        # Also get new posts
         new_posts = client.get_feed(sort="new", limit=10)
         logger.info(f"[observe] New feed: {len(new_posts)} posts")
         
-        # Combine and dedupe
         seen_ids = set()
         combined_feed = []
         for post in feed + new_posts:
@@ -74,7 +110,6 @@ def observe_node(state: AgentState) -> Dict[str, Any]:
                 author = author.get("name", "")
             logger.info(f"[observe]   - '{p.get('title', '?')[:40]}' by {author} (id={p.get('id', '?')[:12]}...)")
         
-        # Get last activity from Firestore
         db = get_firestore()
         state_doc = db.collection(MOLTBOOK_STATE).document("agent").get()
         last_activity = None
@@ -83,7 +118,7 @@ def observe_node(state: AgentState) -> Dict[str, Any]:
             last_activity = state_data.get("last_activity")
         
         return {
-            "feed": combined_feed[:20],  # Keep top 20
+            "feed": combined_feed[:20],
             "notifications": [],
             "last_activity": last_activity
         }
@@ -100,15 +135,12 @@ def observe_node(state: AgentState) -> Dict[str, Any]:
 # ==================== Node: Decide ====================
 
 def decide_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Decide what action to take based on observations.
-    """
+    """Decide what action to take based on observations."""
     if state.get("error"):
         return {"decision": {"action": "nothing", "reason": f"Error in observation: {state['error']}"}}
     
     llm = get_llm()
     
-    # Format feed for prompt
     feed_summary = []
     for post in state.get("feed", [])[:10]:
         feed_summary.append(
@@ -118,18 +150,15 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
         )
     feed_text = "\n".join(feed_summary) if feed_summary else "Feed is empty"
     
-    # Get activity stats from Firestore
     db = get_firestore()
     today = datetime.now().date().isoformat()
     
-    # Count today's posts
     posts_today = db.collection(MOLTBOOK_ACTIVITY)\
         .where("action", "==", "post")\
         .where("date", "==", today)\
         .limit(10).get()
     posts_today_count = len(list(posts_today))
     
-    # Get last post time
     last_post = db.collection(MOLTBOOK_ACTIVITY)\
         .where("action", "==", "post")\
         .order_by("timestamp", direction="DESCENDING")\
@@ -152,7 +181,6 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
         if ts:
             last_comment_time = ts.isoformat() if hasattr(ts, 'isoformat') else str(ts)
     
-    # Build the prompt
     prompt = DECIDE_PROMPT.format(
         observations=feed_text,
         last_post_time=last_post_time,
@@ -169,10 +197,8 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
     response = llm.invoke(messages)
     response_text = response.content.lower()
     
-    # Check if the trigger context is forcing a specific action
     trigger_context = (state.get("trigger_context") or "").lower()
     
-    # Check force_comment FIRST (comment contexts often contain "post" as substring)
     force_comment = any(phrase in trigger_context for phrase in [
         "comment on", "reply to", "respond to", "leave a comment",
         "action: comment", "force comment", "find an interesting post",
@@ -184,7 +210,6 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
         "must post", "should post", "please post", "do a post", "action: post"
     ])
     
-    # Parse the decision
     decision: AgentDecision = {
         "action": "nothing",
         "reason": response.content,
@@ -194,24 +219,17 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
     
     feed = state.get("feed", [])
     
-    # Helper: find best post to comment on from feed
     def find_target_post(response_text: str, feed: list) -> str:
-        """Try multiple strategies to match a post from the feed."""
-        # Strategy 1: Check if LLM mentioned a post title
         for post in feed:
             title = post.get("title", "").lower()
             if title and len(title) > 5 and title[:20] in response_text:
                 return post.get("id")
         
-        # Strategy 2: Check if LLM mentioned a post ID
         for post in feed:
             post_id = post.get("id", "")
             if post_id and post_id in response.content:
                 return post_id
         
-        # Strategy 3: Pick the best post we haven't commented on yet
-        # Prefer posts with fewer comments (more room to add value)
-        # and skip our own posts
         scored = []
         for post in feed:
             author = post.get("author", "")
@@ -220,7 +238,6 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
             if author.lower() in ["azoni-ai", "azoni"]:
                 continue
             
-            # Score: prefer fewer comments, some upvotes, recent
             comment_count = post.get("comment_count", 0)
             upvotes = post.get("upvotes", 0)
             score = max(0, 5 - comment_count) + min(upvotes, 3)
@@ -230,7 +247,6 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
             scored.sort(reverse=True)
             return scored[0][1]
         
-        # Strategy 4: Just pick the first non-self post
         for post in feed:
             author = post.get("author", "")
             if isinstance(author, dict):
@@ -240,7 +256,6 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
         
         return None
     
-    # If context is forcing an action, respect that (override LLM decision)
     if force_comment:
         decision["action"] = "comment"
         decision["target_post_id"] = find_target_post(response_text, feed)
@@ -257,11 +272,9 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
         decision["action"] = "upvote"
         decision["target_post_id"] = find_target_post(response_text, feed)
     
-    # Safety: if we decided to comment but have no target, pick one
     if decision["action"] == "comment" and not decision["target_post_id"] and feed:
         decision["target_post_id"] = find_target_post("", feed)
     
-    # Safety: if we decided to upvote but have no target, pick one
     if decision["action"] == "upvote" and not decision["target_post_id"] and feed:
         decision["target_post_id"] = find_target_post("", feed)
     
@@ -276,9 +289,7 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
 # ==================== Node: Draft ====================
 
 def draft_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Draft content for posting or commenting.
-    """
+    """Draft content for posting or commenting."""
     decision = state.get("decision", {})
     action = decision.get("action")
     
@@ -293,8 +304,7 @@ def draft_node(state: AgentState) -> Dict[str, Any]:
             context=state.get("trigger_context") or decision.get("reason", "Share something interesting"),
             identity=AZONI_IDENTITY
         )
-    else:  # comment
-        # Get the target post details
+    else:
         target_post_id = decision.get("target_post_id")
         target_post = None
         for post in state.get("feed", []):
@@ -303,11 +313,10 @@ def draft_node(state: AgentState) -> Dict[str, Any]:
                 break
         
         if not target_post:
-            logger.warning(f"[draft] Could not find target post {target_post_id} in feed of {len(state.get('feed', []))} posts")
-            # Log available IDs for debugging
+            logger.warning(f"[draft] Could not find target post {target_post_id}")
             feed_ids = [p.get("id", "?")[:12] for p in state.get("feed", [])[:5]]
             logger.warning(f"[draft] Available IDs: {feed_ids}")
-            return {"draft": None, "error": f"Could not find target post {target_post_id} for comment"}
+            return {"draft": None, "error": f"Could not find target post {target_post_id}"}
         
         logger.info(f"[draft] Found target post: '{target_post.get('title', '?')[:40]}'")
         
@@ -326,18 +335,15 @@ def draft_node(state: AgentState) -> Dict[str, Any]:
     response = llm.invoke(messages)
     response_text = response.content
     
-    # Parse the draft
     draft: DraftContent = {
         "content": response_text,
         "title": None,
         "submolt": "general"
     }
     
-    # Try to extract structured fields for posts
     if action == "post":
         import re
         
-        # Try multiple parsing strategies
         lines = response_text.split("\n")
         content_lines = []
         
@@ -345,7 +351,6 @@ def draft_node(state: AgentState) -> Dict[str, Any]:
             line_lower = line.lower().strip()
             line_stripped = line.strip()
             
-            # Match "Title:" or "**Title:**" or "title:" etc
             if line_lower.startswith("title:") or line_lower.startswith("**title"):
                 title_match = re.search(r'[tT]itle[:\s*]+(.+)', line_stripped)
                 if title_match:
@@ -359,33 +364,25 @@ def draft_node(state: AgentState) -> Dict[str, Any]:
                 if content_match:
                     content_lines.append(content_match.group(1).strip())
             elif draft["title"] and not line_lower.startswith(("title", "submolt", "**")):
-                # After we have a title, collect content lines
                 if line_stripped and not line_lower.startswith("---"):
                     content_lines.append(line_stripped)
         
-        # If we found content lines, use them
         if content_lines:
             draft["content"] = "\n".join(content_lines).strip()
         
-        # Fallback: if no title found, generate one from content
         if not draft["title"] and draft["content"]:
-            # Take first sentence or first 60 chars as title
             first_line = draft["content"].split("\n")[0].split(".")[0]
             if len(first_line) > 10:
                 draft["title"] = first_line[:60] + ("..." if len(first_line) > 60 else "")
             else:
                 draft["title"] = "Thoughts from Azoni"
         
-        # Fallback: if still no title
         if not draft["title"]:
             draft["title"] = "Hello from Azoni-AI"
         
-        # Ensure content exists
         if not draft["content"] or draft["content"] == response_text:
-            # Use the whole response as content, minus the title if it's there
             draft["content"] = response_text
         
-        # Default submolt
         if not draft["submolt"]:
             draft["submolt"] = "general"
     
@@ -398,72 +395,45 @@ def draft_node(state: AgentState) -> Dict[str, Any]:
 # ==================== Node: Evaluate ====================
 
 def evaluate_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Evaluate the draft for quality before posting.
-    """
+    """Evaluate the draft for quality before posting."""
     draft = state.get("draft")
     
     if not draft:
-        return {"quality_check": {"approved": False, "score": 0, "issues": ["No draft to evaluate"], "suggestions": []}}
+        return {"quality_check": {"approved": False, "score": 0, "issues": ["No draft"], "suggestions": []}}
     
     decision = state.get("decision", {})
     action = decision.get("action")
     
-    # For comments, be lenient - if we have content, approve it
     if action == "comment" and draft.get("content"):
         return {
-            "quality_check": {
-                "approved": True,
-                "score": 0.8,
-                "issues": [],
-                "suggestions": []
-            },
+            "quality_check": {"approved": True, "score": 0.8, "issues": [], "suggestions": []},
             "llm_calls": state.get("llm_calls", 0)
         }
     
-    # For posts, also be lenient if we have title and content
     if action == "post" and draft.get("content"):
         content = draft.get("content", "").lower()
-        # Only reject if there are obvious red flags
         red_flags = ["error", "undefined", "null", "lorem ipsum", "todo", "fixme", "exception", "traceback"]
         has_red_flags = any(flag in content for flag in red_flags)
         
         if not has_red_flags:
             return {
-                "quality_check": {
-                    "approved": True,
-                    "score": 0.85,
-                    "issues": [],
-                    "suggestions": []
-                },
+                "quality_check": {"approved": True, "score": 0.85, "issues": [], "suggestions": []},
                 "llm_calls": state.get("llm_calls", 0)
             }
     
-    # Only use LLM evaluation if we're unsure
     llm = get_llm()
-    
     draft_text = f"Title: {draft.get('title', 'N/A')}\nContent: {draft.get('content', '')}\nSubmolt: {draft.get('submolt', 'N/A')}"
-    
     prompt = EVALUATE_PROMPT.format(draft=draft_text)
     
     messages = [
-        SystemMessage(content="You are a quality checker for social media posts. Be generous - approve most posts unless they have serious issues. Respond with JSON: {\"approved\": true/false, \"score\": 0.0-1.0, \"issues\": [], \"suggestions\": []}"),
+        SystemMessage(content="You are a quality checker. Be generous - approve most posts unless serious issues. Respond with JSON: {\"approved\": true/false, \"score\": 0.0-1.0, \"issues\": [], \"suggestions\": []}"),
         HumanMessage(content=prompt)
     ]
     
     response = llm.invoke(messages)
-    response_text = response.content.lower()
     
-    # Parse the evaluation
-    quality_check: QualityCheck = {
-        "approved": True,  # Default to approved now
-        "score": 0.8,
-        "issues": [],
-        "suggestions": []
-    }
+    quality_check: QualityCheck = {"approved": True, "score": 0.8, "issues": [], "suggestions": []}
     
-    # Try to parse as JSON first
-    import json
     try:
         import re
         json_match = re.search(r'\{[^}]+\}', response.content)
@@ -476,33 +446,26 @@ def evaluate_node(state: AgentState) -> Dict[str, Any]:
     except:
         pass
     
-    # Even if LLM said no, approve if score is decent
     if quality_check["score"] >= 0.5:
         quality_check["approved"] = True
     
-    return {
-        "quality_check": quality_check,
-        "llm_calls": state.get("llm_calls", 0) + 1
-    }
+    return {"quality_check": quality_check, "llm_calls": state.get("llm_calls", 0) + 1}
 
 
 # ==================== Node: Execute ====================
 
 def execute_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Execute the decided action on Moltbook.
-    """
+    """Execute the decided action on Moltbook."""
     decision = state.get("decision", {})
     action = decision.get("action")
     draft = state.get("draft")
     quality_check = state.get("quality_check", {})
     
-    # Skip if no action or not approved
     if action == "nothing":
-        return {"executed": False, "execution_result": {"skipped": True, "reason": "No action decided"}}
+        return {"executed": False, "execution_result": {"skipped": True, "reason": "No action"}}
     
     if action in ["post", "comment"] and not quality_check.get("approved"):
-        return {"executed": False, "execution_result": {"skipped": True, "reason": "Draft not approved"}}
+        return {"executed": False, "execution_result": {"skipped": True, "reason": "Not approved"}}
     
     client = get_moltbook_client()
     db = get_firestore()
@@ -511,34 +474,73 @@ def execute_node(state: AgentState) -> Dict[str, Any]:
         result = {}
         
         if action == "post":
-            logger.info(f"[execute] Creating post: title='{draft.get('title', '?')[:40]}', submolt={draft.get('submolt')}")
+            logger.info(f"[execute] Creating post: '{draft.get('title', '?')[:40]}'")
             result = client.create_post(
                 title=draft.get("title", "Untitled"),
                 content=draft.get("content", ""),
                 submolt=draft.get("submolt", "general")
             )
             logger.info(f"[execute] Post created: {result.get('post', {}).get('id', '?')}")
+            
+            # === LOG TO AZONI.AI ACTIVITY FEED ===
+            log_agent_activity_sync(
+                activity_type="moltbook_post",
+                title="Posted to Moltbook",
+                description=draft.get("title", "Untitled"),
+                reasoning=decision.get("reason", "")[:200],
+                metadata={
+                    "post_id": result.get("post", {}).get("id"),
+                    "submolt": draft.get("submolt", "general")
+                }
+            )
         
         elif action == "comment":
             target_post_id = decision.get("target_post_id")
-            logger.info(f"[execute] Commenting on post {target_post_id}, content: '{draft.get('content', '')[:50]}...'")
+            logger.info(f"[execute] Commenting on {target_post_id}")
             if target_post_id:
-                result = client.create_comment(
-                    post_id=target_post_id,
-                    content=draft.get("content", "")
+                result = client.create_comment(post_id=target_post_id, content=draft.get("content", ""))
+                logger.info(f"[execute] Comment created")
+                
+                post_title = "a post"
+                for post in state.get("feed", []):
+                    if post.get("id") == target_post_id:
+                        post_title = post.get("title", "a post")[:50]
+                        break
+                
+                # === LOG TO AZONI.AI ACTIVITY FEED ===
+                log_agent_activity_sync(
+                    activity_type="moltbook_comment",
+                    title="Commented on Moltbook",
+                    description=f"Replied to: {post_title}",
+                    reasoning=decision.get("reason", "")[:200],
+                    metadata={"post_id": target_post_id}
                 )
-                logger.info(f"[execute] Comment created: {result}")
             else:
-                logger.warning(f"[execute] No target_post_id for comment!")
+                logger.warning("[execute] No target_post_id for comment!")
         
         elif action == "upvote":
             target_post_id = decision.get("target_post_id")
-            logger.info(f"[execute] Upvoting post {target_post_id}")
+            logger.info(f"[execute] Upvoting {target_post_id}")
             if target_post_id:
                 result = client.upvote_post(target_post_id)
-                logger.info(f"[execute] Upvoted: {result}")
+                logger.info(f"[execute] Upvoted")
+                
+                post_title = "a post"
+                for post in state.get("feed", []):
+                    if post.get("id") == target_post_id:
+                        post_title = post.get("title", "a post")[:50]
+                        break
+                
+                # === LOG TO AZONI.AI ACTIVITY FEED ===
+                log_agent_activity_sync(
+                    activity_type="moltbook_upvote",
+                    title="Upvoted on Moltbook",
+                    description=f"Upvoted: {post_title}",
+                    reasoning="Quality content worth promoting",
+                    metadata={"post_id": target_post_id}
+                )
         
-        # Log to Firestore
+        # Log to Firestore (existing behavior)
         db.collection(MOLTBOOK_ACTIVITY).add({
             "action": action,
             "timestamp": datetime.now(),
@@ -551,22 +553,15 @@ def execute_node(state: AgentState) -> Dict[str, Any]:
             "trigger_context": state.get("trigger_context")
         })
         
-        # Update last activity
         db.collection(MOLTBOOK_STATE).document("agent").set({
             "last_activity": datetime.now(),
             "last_action": action
         }, merge=True)
         
-        return {
-            "executed": True,
-            "execution_result": result,
-            "completed_at": datetime.now()
-        }
+        return {"executed": True, "execution_result": result, "completed_at": datetime.now()}
     
     except Exception as e:
         logger.error(f"[execute] FAILED: {e}")
-        logger.error(f"[execute] action={action}, target_post_id={decision.get('target_post_id')}, draft_content={draft.get('content', '')[:50] if draft else 'None'}")
-        # Log error
         db.collection(MOLTBOOK_ACTIVITY).add({
             "action": action,
             "timestamp": datetime.now(),
@@ -575,23 +570,15 @@ def execute_node(state: AgentState) -> Dict[str, Any]:
             "decision": decision,
             "trigger": state.get("trigger")
         })
-        
-        return {
-            "executed": False,
-            "error": str(e),
-            "completed_at": datetime.now()
-        }
+        return {"executed": False, "error": str(e), "completed_at": datetime.now()}
 
 
 # ==================== Node: Log ====================
 
 def log_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Final logging node - record the complete run.
-    """
+    """Final logging node."""
     db = get_firestore()
     
-    # Create a run summary
     run_summary = {
         "started_at": state.get("started_at"),
         "completed_at": datetime.now(),
@@ -604,7 +591,6 @@ def log_node(state: AgentState) -> Dict[str, Any]:
         "feed_posts_seen": len(state.get("feed", [])),
     }
     
-    # Store run log
     db.collection(MOLTBOOK_STATE).document("agent").set({
         "last_run": run_summary,
         "last_run_at": datetime.now()
