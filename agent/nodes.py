@@ -88,6 +88,15 @@ def observe_node(state: AgentState) -> Dict[str, Any]:
     """Observe the Moltbook feed and gather context."""
     client = get_moltbook_client()
     
+    # Log that we're starting to observe
+    log_agent_activity_sync(
+        activity_type="agent_observing",
+        title="Scanning Moltbook",
+        description="Reading the feed to find interesting discussions",
+        reasoning="Starting a new cycle to see what's happening on the platform",
+        metadata={"step": "observe"}
+    )
+    
     try:
         feed = client.get_feed(sort="hot", limit=15)
         logger.info(f"[observe] Hot feed: {len(feed)} posts")
@@ -280,6 +289,21 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
     
     logger.info(f"[decide] Action: {decision['action']}, target_post_id: {decision.get('target_post_id')}, reason: {decision.get('reason', '')[:80]}")
     
+    # Log the decision
+    if decision["action"] != "nothing":
+        action_descriptions = {
+            "post": "Creating a new post",
+            "comment": "Writing a comment",
+            "upvote": "Upvoting content"
+        }
+        log_agent_activity_sync(
+            activity_type="agent_deciding",
+            title=f"Decided to {decision['action']}",
+            description=action_descriptions.get(decision["action"], decision["action"]),
+            reasoning=decision.get("reason", "")[:300],
+            metadata={"step": "decide", "action": decision["action"], "target_post_id": decision.get("target_post_id")}
+        )
+    
     return {
         "decision": decision,
         "llm_calls": state.get("llm_calls", 0) + 1
@@ -326,6 +350,16 @@ def draft_node(state: AgentState) -> Dict[str, Any]:
             post_author=target_post.get("author", ""),
             identity=AZONI_IDENTITY
         )
+    
+    # Log that we're drafting
+    drafting_desc = "Writing a new post" if action == "post" else f"Composing a reply"
+    log_agent_activity_sync(
+        activity_type="agent_drafting",
+        title=f"Drafting {action}",
+        description=drafting_desc,
+        reasoning="Crafting thoughtful content based on my decision",
+        metadata={"step": "draft", "action": action}
+    )
     
     messages = [
         SystemMessage(content=AZONI_IDENTITY),
