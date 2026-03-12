@@ -18,11 +18,12 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from agent.state import AgentState, AgentDecision, DraftContent, QualityCheck
 from agent.tools import get_moltbook_client
 from agent.personality import (
-    AZONI_IDENTITY, 
-    OBSERVE_PROMPT, 
+    AZONI_IDENTITY,
+    OBSERVE_PROMPT,
     DECIDE_PROMPT,
     DRAFT_POST_PROMPT,
     DRAFT_COMMENT_PROMPT,
+    DRAFT_DM_PROMPT,
     EVALUATE_PROMPT
 )
 from config.settings import settings
@@ -82,6 +83,22 @@ def get_llm():
     )
 
 
+# ==================== Helpers ====================
+
+def _extract_author_name(author) -> str:
+    """Extract author name from string or object."""
+    if isinstance(author, dict):
+        return author.get("name", "unknown")
+    return author or "unknown"
+
+
+def _extract_submolt_name(submolt) -> str:
+    """Extract submolt name from string or object."""
+    if isinstance(submolt, dict):
+        return submolt.get("name", "general")
+    return submolt or "general"
+
+
 # ==================== Node: Observe ====================
 
 def observe_node(state: AgentState) -> Dict[str, Any]:
@@ -97,13 +114,31 @@ def observe_node(state: AgentState) -> Dict[str, Any]:
         metadata={"step": "observe"}
     )
     
+    # Try to get /home data first (non-fatal)
+    home_data = None
+    dm_activity = None
+    try:
+        home_data = client.get_home()
+        logger.info(f"[observe] Home data: karma={home_data.get('karma', '?')}, "
+                     f"notifications={home_data.get('unread_notifications', 0)}")
+    except Exception as e:
+        logger.warning(f"[observe] /home failed (non-fatal): {e}")
+
+    # Check DMs (non-fatal)
+    try:
+        dm_activity = client.check_dms()
+        if dm_activity and dm_activity.get("has_activity"):
+            logger.info(f"[observe] DM activity detected")
+    except Exception as e:
+        logger.warning(f"[observe] DM check failed (non-fatal): {e}")
+
     try:
         feed = client.get_feed(sort="hot", limit=15)
         logger.info(f"[observe] Hot feed: {len(feed)} posts")
-        
+
         new_posts = client.get_feed(sort="new", limit=10)
         logger.info(f"[observe] New feed: {len(new_posts)} posts")
-        
+
         seen_ids = set()
         combined_feed = []
         for post in feed + new_posts:
@@ -111,33 +146,35 @@ def observe_node(state: AgentState) -> Dict[str, Any]:
             if post_id and post_id not in seen_ids:
                 seen_ids.add(post_id)
                 combined_feed.append(post)
-        
+
         logger.info(f"[observe] Combined feed: {len(combined_feed)} unique posts")
         for p in combined_feed[:3]:
-            author = p.get("author", "")
-            if isinstance(author, dict):
-                author = author.get("name", "")
+            author = _extract_author_name(p.get("author", ""))
             logger.info(f"[observe]   - '{p.get('title', '?')[:40]}' by {author} (id={p.get('id', '?')[:12]}...)")
-        
+
         db = get_firestore()
         state_doc = db.collection(MOLTBOOK_STATE).document("agent").get()
         last_activity = None
         if state_doc.exists:
             state_data = state_doc.to_dict()
             last_activity = state_data.get("last_activity")
-        
+
         return {
             "feed": combined_feed[:20],
             "notifications": [],
-            "last_activity": last_activity
+            "last_activity": last_activity,
+            "home_data": home_data,
+            "dm_activity": dm_activity
         }
-    
+
     except Exception as e:
         logger.error(f"[observe] FAILED: {e}")
         return {
             "feed": [],
             "notifications": [],
-            "error": f"Failed to observe: {str(e)}"
+            "error": f"Failed to observe: {str(e)}",
+            "home_data": home_data,
+            "dm_activity": dm_activity
         }
 
 
@@ -152,9 +189,11 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
     
     feed_summary = []
     for post in state.get("feed", [])[:10]:
+        author = _extract_author_name(post.get("author", "unknown"))
+        submolt = _extract_submolt_name(post.get("submolt", "general"))
         feed_summary.append(
-            f"- [{post.get('submolt', 'general')}] {post.get('title', 'No title')} "
-            f"by {post.get('author', 'unknown')} ({post.get('upvotes', 0)} upvotes, "
+            f"- [{submolt}] {post.get('title', 'No title')} "
+            f"by {author} ({post.get('upvotes', 0)} upvotes, "
             f"{post.get('comment_count', 0)} comments)"
         )
     feed_text = "\n".join(feed_summary) if feed_summary else "Feed is empty"
@@ -190,12 +229,32 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
         if ts:
             last_comment_time = ts.isoformat() if hasattr(ts, 'isoformat') else str(ts)
     
+    # Build home context from /home data
+    home_data = state.get("home_data") or {}
+    home_parts = []
+    if home_data.get("karma"):
+        home_parts.append(f"Your karma: {home_data['karma']}")
+    if home_data.get("unread_notifications"):
+        home_parts.append(f"Unread notifications: {home_data['unread_notifications']}")
+    dm_activity = state.get("dm_activity") or {}
+    if dm_activity.get("has_activity"):
+        requests = dm_activity.get("requests", {})
+        messages = dm_activity.get("messages", {})
+        req_count = requests.get("count", 0) if isinstance(requests, dict) else 0
+        msg_count = messages.get("count", 0) if isinstance(messages, dict) else 0
+        if req_count:
+            home_parts.append(f"Pending DM requests: {req_count}")
+        if msg_count:
+            home_parts.append(f"Unread DMs: {msg_count}")
+    home_context = "\n".join(home_parts) if home_parts else "No home data available"
+
     prompt = DECIDE_PROMPT.format(
         observations=feed_text,
         last_post_time=last_post_time,
         posts_today=posts_today_count,
         last_comment_time=last_comment_time,
-        trigger_context=state.get("trigger_context") or "Regular heartbeat check"
+        trigger_context=state.get("trigger_context") or "Regular heartbeat check",
+        home_context=home_context
     )
     
     messages = [
@@ -223,8 +282,24 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
         "action": "nothing",
         "reason": response.content,
         "target_post_id": None,
-        "target_submolt": None
+        "target_submolt": None,
+        "target_conversation_id": None
     }
+
+    # Priority: if we have unread DMs, consider replying
+    if dm_activity.get("has_activity"):
+        messages_data = dm_activity.get("messages", {})
+        if isinstance(messages_data, dict) and messages_data.get("count", 0) > 0:
+            latest = messages_data.get("latest", [])
+            if latest:
+                decision["action"] = "reply_dm"
+                decision["target_conversation_id"] = latest[0].get("conversation_id")
+                decision["reason"] = "Responding to unread DM"
+                logger.info(f"[decide] Prioritizing DM reply over feed actions")
+                return {
+                    "decision": decision,
+                    "llm_calls": state.get("llm_calls", 0) + 1
+                }
     
     feed = state.get("feed", [])
     
@@ -280,6 +355,8 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
     elif "\"upvote\"" in response_text or "action: upvote" in response_text:
         decision["action"] = "upvote"
         decision["target_post_id"] = find_target_post(response_text, feed)
+    elif "\"reply_dm\"" in response_text or "action: reply_dm" in response_text:
+        decision["action"] = "reply_dm"
     
     if decision["action"] == "comment" and not decision["target_post_id"] and feed:
         decision["target_post_id"] = find_target_post("", feed)
@@ -294,7 +371,8 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
         action_descriptions = {
             "post": "Creating a new post",
             "comment": "Writing a comment",
-            "upvote": "Upvoting content"
+            "upvote": "Upvoting content",
+            "reply_dm": "Replying to a DM"
         }
         log_agent_activity_sync(
             activity_type="agent_deciding",
@@ -317,12 +395,62 @@ def draft_node(state: AgentState) -> Dict[str, Any]:
     decision = state.get("decision", {})
     action = decision.get("action")
     
-    if action not in ["post", "comment"]:
+    if action not in ["post", "comment", "reply_dm"]:
         logger.info(f"[draft] Skipping - action is '{action}'")
         return {"draft": None}
-    
+
     llm = get_llm()
-    
+
+    if action == "reply_dm":
+        conv_id = decision.get("target_conversation_id")
+        if not conv_id:
+            logger.warning("[draft] No conversation_id for reply_dm")
+            return {"draft": None, "error": "No conversation_id for reply_dm"}
+
+        try:
+            client = get_moltbook_client()
+            conversation = client.read_conversation(conv_id)
+            conv_messages = conversation.get("messages", [])
+            last_msg = conv_messages[-1] if conv_messages else {}
+
+            their_name = last_msg.get("author", "someone")
+            if isinstance(their_name, dict):
+                their_name = their_name.get("name", "someone")
+
+            prompt = DRAFT_DM_PROMPT.format(
+                message_content=last_msg.get("content", ""),
+                author_name=their_name,
+                identity=AZONI_IDENTITY
+            )
+
+            messages = [
+                SystemMessage(content=AZONI_IDENTITY),
+                HumanMessage(content=prompt)
+            ]
+
+            response = llm.invoke(messages)
+            draft: DraftContent = {
+                "content": response.content.strip(),
+                "title": None,
+                "submolt": None
+            }
+
+            log_agent_activity_sync(
+                activity_type="agent_drafting",
+                title="Drafting DM reply",
+                description=f"Replying to {their_name}",
+                reasoning="Responding to a direct message",
+                metadata={"step": "draft", "action": "reply_dm", "conversation_id": conv_id}
+            )
+
+            return {
+                "draft": draft,
+                "llm_calls": state.get("llm_calls", 0) + 1
+            }
+        except Exception as e:
+            logger.error(f"[draft] DM draft failed: {e}")
+            return {"draft": None, "error": f"DM draft failed: {e}"}
+
     if action == "post":
         prompt = DRAFT_POST_PROMPT.format(
             context=state.get("trigger_context") or decision.get("reason", "Share something interesting"),
@@ -347,7 +475,7 @@ def draft_node(state: AgentState) -> Dict[str, Any]:
         prompt = DRAFT_COMMENT_PROMPT.format(
             post_title=target_post.get("title", ""),
             post_content=target_post.get("content", ""),
-            post_author=target_post.get("author", ""),
+            post_author=_extract_author_name(target_post.get("author", "")),
             identity=AZONI_IDENTITY
         )
     
@@ -438,7 +566,7 @@ def evaluate_node(state: AgentState) -> Dict[str, Any]:
     decision = state.get("decision", {})
     action = decision.get("action")
     
-    if action == "comment" and draft.get("content"):
+    if action in ["comment", "reply_dm"] and draft.get("content"):
         return {
             "quality_check": {"approved": True, "score": 0.8, "issues": [], "suggestions": []},
             "llm_calls": state.get("llm_calls", 0)
@@ -498,7 +626,7 @@ def execute_node(state: AgentState) -> Dict[str, Any]:
     if action == "nothing":
         return {"executed": False, "execution_result": {"skipped": True, "reason": "No action"}}
     
-    if action in ["post", "comment"] and not quality_check.get("approved"):
+    if action in ["post", "comment", "reply_dm"] and not quality_check.get("approved"):
         return {"executed": False, "execution_result": {"skipped": True, "reason": "Not approved"}}
     
     client = get_moltbook_client()
@@ -541,6 +669,12 @@ def execute_node(state: AgentState) -> Dict[str, Any]:
                         post_title = post.get("title", "a post")[:50]
                         break
                 
+                # Mark notifications read for this post (non-fatal)
+                try:
+                    client.mark_notifications_read(target_post_id)
+                except Exception:
+                    pass
+
                 # === LOG TO AZONI.AI ACTIVITY FEED ===
                 log_agent_activity_sync(
                     activity_type="moltbook_comment",
@@ -552,19 +686,50 @@ def execute_node(state: AgentState) -> Dict[str, Any]:
             else:
                 logger.warning("[execute] No target_post_id for comment!")
         
+        elif action == "reply_dm":
+            conv_id = decision.get("target_conversation_id")
+            logger.info(f"[execute] Sending DM reply to conversation {conv_id}")
+            if conv_id and draft:
+                result = client.send_dm(conv_id, draft.get("content", ""))
+                logger.info(f"[execute] DM sent")
+
+                log_agent_activity_sync(
+                    activity_type="moltbook_dm",
+                    title="Replied to DM",
+                    description=draft.get("content", "")[:100],
+                    reasoning=decision.get("reason", "")[:200],
+                    metadata={"conversation_id": conv_id}
+                )
+
         elif action == "upvote":
             target_post_id = decision.get("target_post_id")
             logger.info(f"[execute] Upvoting {target_post_id}")
             if target_post_id:
                 result = client.upvote_post(target_post_id)
                 logger.info(f"[execute] Upvoted")
-                
+
+                # Follow the author if not already following
+                if result.get("already_following") is False:
+                    target_post = None
+                    for post in state.get("feed", []):
+                        if post.get("id") == target_post_id:
+                            target_post = post
+                            break
+                    if target_post:
+                        author_name = _extract_author_name(target_post.get("author", ""))
+                        if author_name and author_name.lower() not in ["azoni-ai", "azoni", "unknown"]:
+                            try:
+                                client.follow_agent(author_name)
+                                logger.info(f"[execute] Followed {author_name} after upvoting")
+                            except Exception:
+                                pass
+
                 post_title = "a post"
                 for post in state.get("feed", []):
                     if post.get("id") == target_post_id:
                         post_title = post.get("title", "a post")[:50]
                         break
-                
+
                 # === LOG TO AZONI.AI ACTIVITY FEED ===
                 log_agent_activity_sync(
                     activity_type="moltbook_upvote",

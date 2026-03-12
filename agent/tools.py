@@ -275,14 +275,20 @@ class MoltbookClient:
         url: Optional[str] = None
     ) -> Dict[str, Any]:
         """Create a new post."""
-        payload = {"title": title, "submolt": submolt}
+        payload = {"title": title, "submolt_name": submolt}
         if content:
             payload["content"] = content
         if url:
             payload["url"] = url
-        
+
         response = self._request("post", f"{self.base_url}/posts", json=payload)
-        return response.json()
+        data = response.json()
+
+        # Handle verification challenge if required
+        if data.get("verification_required"):
+            data = self._handle_verification(data)
+
+        return data
     
     # ==================== Comments ====================
     
@@ -318,11 +324,17 @@ class MoltbookClient:
         payload = {"content": content}
         if parent_id:
             payload["parent_id"] = parent_id
-        
+
         response = self._request("post", f"{self.base_url}/posts/{post_id}/comments",
             json=payload
         )
-        return response.json()
+        data = response.json()
+
+        # Handle verification challenge if required
+        if data.get("verification_required"):
+            data = self._handle_verification(data)
+
+        return data
     
     # ==================== Voting ====================
     
@@ -384,6 +396,180 @@ class MoltbookClient:
         """View another molty's profile."""
         response = self._request("get", f"{self.base_url}/agents/profile",
             params={"name": name}
+        )
+        return response.json()
+
+    # ==================== Home / Dashboard ====================
+
+    def get_home(self) -> Dict[str, Any]:
+        """Get home dashboard data (karma, notifications, DMs, activity)."""
+        response = self._request("get", f"{self.base_url}/home")
+        return response.json()
+
+    # ==================== Verification ====================
+
+    def verify_challenge(self, code: str, answer: str) -> Dict[str, Any]:
+        """Submit a verification challenge answer."""
+        response = self._request("post", f"{self.base_url}/verify",
+            json={"code": code, "answer": answer}
+        )
+        return response.json()
+
+    def _handle_verification(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle verification challenge from post/comment response."""
+        challenge = data.get("challenge", "")
+        code = data.get("verification_code", "")
+
+        if not challenge or not code:
+            logger.warning("[verification] Missing challenge or code in response")
+            return data
+
+        logger.info(f"[verification] Challenge received: {challenge[:80]}...")
+
+        # Try programmatic solving first
+        from agent.verification import solve_challenge
+        answer = solve_challenge(challenge)
+
+        # Fallback to LLM if programmatic fails
+        if answer is None:
+            answer = self._llm_solve_challenge(challenge)
+
+        if answer is None:
+            logger.error("[verification] Could not solve challenge")
+            return data
+
+        # Submit answer
+        try:
+            result = self.verify_challenge(code, answer)
+            logger.info(f"[verification] Submitted answer '{answer}', result: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"[verification] Failed to submit: {e}")
+            return data
+
+    def _llm_solve_challenge(self, challenge_text: str) -> Optional[str]:
+        """Use LLM as fallback to solve verification challenges."""
+        try:
+            from langchain_openai import ChatOpenAI
+            from langchain_core.messages import HumanMessage, SystemMessage
+            from config.settings import settings
+
+            llm = ChatOpenAI(
+                model=settings.default_model.split("/")[-1],
+                openai_api_key=settings.openrouter_api_key,
+                openai_api_base="https://openrouter.ai/api/v1",
+                request_timeout=30,
+                default_headers={
+                    "HTTP-Referer": "https://azoni.ai",
+                    "X-Title": "Azoni Moltbook Agent"
+                }
+            )
+
+            prompt = f"""Solve this obfuscated math word problem. The text has random caps and symbols mixed in.
+
+Challenge: {challenge_text}
+
+Steps:
+1. Remove all non-letter characters and normalize to lowercase
+2. Identify the two numbers (written as words like "twenty five")
+3. Identify the math operation (adds/plus = +, loses/minus = -, times = *, divided = /)
+4. Calculate the result
+5. Return ONLY the number with exactly 2 decimal places (e.g. "15.00")
+
+Answer (number only):"""
+
+            response = llm.invoke([
+                SystemMessage(content="You solve obfuscated math problems. Reply with ONLY the numeric answer with 2 decimal places."),
+                HumanMessage(content=prompt)
+            ])
+
+            answer = response.content.strip()
+            # Clean up - extract just the number
+            import re
+            match = re.search(r'-?\d+\.?\d*', answer)
+            if match:
+                num = float(match.group())
+                return f"{num:.2f}"
+
+            return None
+        except Exception as e:
+            logger.error(f"[verification] LLM solve failed: {e}")
+            return None
+
+    # ==================== Following ====================
+
+    def follow_agent(self, name: str) -> Dict[str, Any]:
+        """Follow a molty."""
+        response = self._request("post", f"{self.base_url}/agents/{name}/follow")
+        return response.json()
+
+    def unfollow_agent(self, name: str) -> Dict[str, Any]:
+        """Unfollow a molty."""
+        response = self._request("delete", f"{self.base_url}/agents/{name}/follow")
+        return response.json()
+
+    # ==================== Notifications ====================
+
+    def mark_notifications_read(self, post_id: str) -> Dict[str, Any]:
+        """Mark notifications as read for a specific post."""
+        response = self._request("post", f"{self.base_url}/notifications/read-by-post/{post_id}")
+        return response.json()
+
+    def mark_all_notifications_read(self) -> Dict[str, Any]:
+        """Mark all notifications as read."""
+        response = self._request("post", f"{self.base_url}/notifications/read-all")
+        return response.json()
+
+    # ==================== Direct Messages ====================
+
+    def check_dms(self) -> Dict[str, Any]:
+        """Check for DM activity (requests + unread messages)."""
+        response = self._request("get", f"{self.base_url}/agents/dm/check")
+        return response.json()
+
+    def get_dm_requests(self) -> Dict[str, Any]:
+        """Get pending DM requests."""
+        response = self._request("get", f"{self.base_url}/agents/dm/requests")
+        return response.json()
+
+    def send_dm_request(self, to: str, message: str) -> Dict[str, Any]:
+        """Send a DM request to another molty."""
+        response = self._request("post", f"{self.base_url}/agents/dm/request",
+            json={"to": to, "message": message}
+        )
+        return response.json()
+
+    def approve_dm_request(self, conversation_id: str) -> Dict[str, Any]:
+        """Approve a pending DM request."""
+        response = self._request("post",
+            f"{self.base_url}/agents/dm/requests/{conversation_id}/approve"
+        )
+        return response.json()
+
+    def reject_dm_request(self, conversation_id: str) -> Dict[str, Any]:
+        """Reject a pending DM request."""
+        response = self._request("post",
+            f"{self.base_url}/agents/dm/requests/{conversation_id}/reject"
+        )
+        return response.json()
+
+    def list_conversations(self) -> Dict[str, Any]:
+        """List all DM conversations."""
+        response = self._request("get", f"{self.base_url}/agents/dm/conversations")
+        return response.json()
+
+    def read_conversation(self, conversation_id: str) -> Dict[str, Any]:
+        """Read messages in a conversation."""
+        response = self._request("get",
+            f"{self.base_url}/agents/dm/conversations/{conversation_id}"
+        )
+        return response.json()
+
+    def send_dm(self, conversation_id: str, message: str) -> Dict[str, Any]:
+        """Send a message in a conversation."""
+        response = self._request("post",
+            f"{self.base_url}/agents/dm/conversations/{conversation_id}/send",
+            json={"message": message}
         )
         return response.json()
 

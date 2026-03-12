@@ -26,7 +26,7 @@ def should_draft(state: AgentState) -> Literal["draft", "execute"]:
     decision = state.get("decision", {})
     action = decision.get("action", "nothing")
     
-    if action in ["post", "comment"]:
+    if action in ["post", "comment", "reply_dm"]:
         return "draft"
     else:
         # Skip draft and evaluate for upvote/nothing
@@ -42,7 +42,7 @@ def should_execute(state: AgentState) -> Literal["execute", "log"]:
     action = decision.get("action", "nothing")
     
     # Always execute for upvote/nothing (nothing just logs)
-    if action not in ["post", "comment"]:
+    if action not in ["post", "comment", "reply_dm"]:
         return "execute"
     
     # For post/comment, check if approved
@@ -142,6 +142,8 @@ def run_agent(
         "decision": None,
         "draft": None,
         "quality_check": None,
+        "home_data": None,
+        "dm_activity": None,
         "executed": False,
         "execution_result": None,
         "error": None,

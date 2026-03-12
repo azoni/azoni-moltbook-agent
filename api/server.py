@@ -172,7 +172,7 @@ def _get_cached_moltbook_status():
 
 
 # Default intervals (minutes)
-DEFAULT_INTERVALS = {"post": 45, "comment": 10, "reply": 8, "upvote": 15, "watcher": 5}
+DEFAULT_INTERVALS = {"post": 45, "comment": 10, "reply": 8, "upvote": 15, "watcher": 5, "dm_check": 15}
 
 
 def require_admin(x_admin_key: Optional[str] = Header(None)):
@@ -191,6 +191,7 @@ JOB_FUNCTIONS = {
     "reply": ("reply_job", None),
     "upvote": ("upvote_job", None),
     "watcher": ("new_post_watcher", None),
+    "dm_check": ("dm_check_job", None),
 }
 
 
@@ -239,14 +240,16 @@ def reschedule_jobs():
         "reply": reply_job,
         "upvote": upvote_job,
         "watcher": new_post_watcher,
+        "dm_check": dm_check_job,
     }
-    
+
     job_id_map = {
         "post": "post_job",
         "comment": "comment_job",
         "reply": "reply_job",
         "upvote": "upvote_job",
         "watcher": "new_post_watcher",
+        "dm_check": "dm_check_job",
     }
     
     for name, minutes in intervals.items():
@@ -367,6 +370,7 @@ def log_job(job_name: str, status: str, details: dict):
             "reply": {"reads": 5, "writes": 2},      # posts read + comments read + existing checks + writes
             "upvote": {"reads": 4, "writes": 2},     # feed read + existing checks + activity writes
             "watcher": {"reads": 4, "writes": 2},    # new posts + existing checks + activity writes
+            "dm_check": {"reads": 2, "writes": 1},   # DM check + activity write
         }
         est = ops.get(job_name, {"reads": 1, "writes": 1})
         _fs_track("reads", est["reads"])
@@ -868,7 +872,13 @@ Keep it short (1-3 sentences). Be genuine.'''
                     reply_content = response.content.strip()
                     
                     result = client.create_comment(post_id=post_id, content=reply_content, parent_id=comment_id)
-                    
+
+                    # Mark notifications read for this post
+                    try:
+                        client.mark_notifications_read(post_id)
+                    except Exception:
+                        pass
+
                     db.collection(MOLTBOOK_ACTIVITY).add({
                         "action": "comment",
                         "timestamp": datetime.now(),
@@ -878,7 +888,7 @@ Keep it short (1-3 sentences). Be genuine.'''
                         "result": result,
                         "trigger": "reply_job"
                     })
-                    
+
                     logger.info(f"Replied to {author_name} ({replies_made + 1}/{max_replies_per_run})")
                     replies_made += 1
                     
@@ -1068,6 +1078,19 @@ def upvote_job():
                 })
                 
                 logger.info(f"Upvoted: {post.get('title', 'Unknown')[:50]}")
+
+                # Follow the author after upvoting
+                if result.get("already_following") is False:
+                    author = post.get("author", "")
+                    if isinstance(author, dict):
+                        author = author.get("name", "")
+                    if author and author.lower() not in ["azoni-ai", "azoni", "unknown"]:
+                        try:
+                            client.follow_agent(author)
+                            logger.info(f"Followed {author} after upvoting")
+                        except Exception:
+                            pass
+
                 upvoted += 1
                 if upvoted >= 3:  # Upvote up to 3 per run
                     log_job("upvote", "success", {"upvoted": upvoted})
@@ -1087,6 +1110,123 @@ def upvote_job():
     except Exception as e:
         logger.error(f"Upvote job failed: {e}")
         log_job("upvote", "failed", {"error": str(e)[:100]})
+
+
+def dm_check_job():
+    """Check and respond to DMs every 15 minutes."""
+    logger.info(f"DM check job triggered at {datetime.now()}")
+
+    if not check_autonomous_mode():
+        log_job("dm_check", "skipped", {"reason": "autonomous mode off"})
+        return
+
+    circuit = get_circuit_status()
+    if circuit["is_open"]:
+        logger.warning("DM check skipped: Moltbook API circuit breaker open")
+        log_job("dm_check", "skipped", {"reason": "Moltbook API down (circuit breaker)"})
+        return
+
+    try:
+        from langchain_openai import ChatOpenAI
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from agent.personality import AZONI_IDENTITY
+
+        client = get_moltbook_client()
+        db = get_firestore()
+
+        llm = ChatOpenAI(
+            model=settings.default_model.split("/")[-1],
+            openai_api_key=settings.openrouter_api_key,
+            openai_api_base="https://openrouter.ai/api/v1",
+            request_timeout=60,
+            default_headers={"HTTP-Referer": "https://azoni.ai", "X-Title": "Azoni Moltbook Agent"}
+        )
+
+        dm_check = client.check_dms()
+        if not dm_check.get("has_activity"):
+            logger.info("No DM activity")
+            log_job("dm_check", "skipped", {"reason": "no DM activity"})
+            return
+
+        # Approve pending requests
+        requests_data = dm_check.get("requests", {})
+        request_items = requests_data.get("items", []) if isinstance(requests_data, dict) else []
+        for req in request_items:
+            conv_id = req.get("conversation_id")
+            if conv_id:
+                try:
+                    client.approve_dm_request(conv_id)
+                    from_name = req.get("from", {})
+                    if isinstance(from_name, dict):
+                        from_name = from_name.get("name", "?")
+                    logger.info(f"Approved DM request from {from_name}")
+                except Exception as e:
+                    logger.error(f"Failed to approve DM request: {e}")
+
+        # Reply to unread messages
+        messages_data = dm_check.get("messages", {})
+        latest = messages_data.get("latest", []) if isinstance(messages_data, dict) else []
+        replies_sent = 0
+        for msg in latest[:3]:
+            conv_id = msg.get("conversation_id")
+            if not conv_id:
+                continue
+
+            try:
+                conversation = client.read_conversation(conv_id)
+                conv_messages = conversation.get("messages", [])
+                last_msg = conv_messages[-1] if conv_messages else {}
+
+                their_name = last_msg.get("author", "someone")
+                if isinstance(their_name, dict):
+                    their_name = their_name.get("name", "someone")
+
+                prompt = f"""Someone sent you a direct message on Moltbook. Write a brief, friendly reply.
+
+Their message: "{last_msg.get('content', '')}"
+Author: {their_name}
+
+Guidelines:
+- Be conversational and genuine
+- Keep it concise (1-3 sentences)
+- If they asked a question, answer it
+- Be warm and welcoming
+
+Write only the reply, nothing else."""
+
+                response = llm.invoke([
+                    SystemMessage(content=AZONI_IDENTITY),
+                    HumanMessage(content=prompt)
+                ])
+
+                reply = response.content.strip()
+                client.send_dm(conv_id, reply)
+                replies_sent += 1
+
+                logger.info(f"Replied to DM in conversation {conv_id}")
+
+                db.collection(MOLTBOOK_ACTIVITY).add({
+                    "action": "dm_reply",
+                    "timestamp": datetime.now(),
+                    "date": datetime.now().date().isoformat(),
+                    "draft": {"content": reply[:200]},
+                    "decision": {"action": "dm_reply", "conversation_id": conv_id},
+                    "trigger": "dm_check_job"
+                })
+            except Exception as e:
+                logger.error(f"Failed to reply to DM {conv_id}: {e}")
+
+        log_job("dm_check", "success" if replies_sent > 0 else "skipped", {
+            "replies_sent": replies_sent,
+            "requests_approved": len(request_items)
+        })
+
+    except MoltbookAPIError as e:
+        logger.warning(f"DM check: Moltbook API error: {e}")
+        log_job("dm_check", "skipped", {"reason": f"Moltbook API: {str(e)[:100]}"})
+    except Exception as e:
+        logger.error(f"DM check job failed: {e}")
+        log_job("dm_check", "failed", {"error": str(e)[:100]})
 
 
 # ==================== App Lifecycle ====================
@@ -1216,11 +1356,16 @@ class CommentRequest(BaseModel):
     content: str
 
 
+class DMSendRequest(BaseModel):
+    conversation_id: str
+    message: str
+
+
 class ConfigUpdate(BaseModel):
     autonomous_mode: Optional[bool] = None
     max_posts_per_day: Optional[int] = None
     post_topics: Optional[List[str]] = None
-    intervals: Optional[Dict] = None  # {"post": 45, "comment": 10, "reply": 8, "upvote": 15, "watcher": 5}
+    intervals: Optional[Dict] = None  # {"post": 45, "comment": 10, "reply": 8, "upvote": 15, "watcher": 5, "dm_check": 15}
 
 
 # ==================== Endpoints ====================
@@ -1358,6 +1503,7 @@ async def root():
             "reply": {"interval": f"{current_intervals.get('reply', 8)} min", "desc": "Replies to comments on your posts quickly", "icon": "↩️"},
             "upvote": {"interval": f"{current_intervals.get('upvote', 15)} min", "desc": "Upvotes quality content from the community", "icon": "👍"},
             "new_post_watcher": {"interval": f"{current_intervals.get('watcher', 5)} min", "desc": "Watches for new posts and comments first", "icon": "👀"},
+            "dm_check": {"interval": f"{current_intervals.get('dm_check', 15)} min", "desc": "Checks and responds to direct messages", "icon": "✉️"},
         }
         
         next_jobs = []
@@ -1461,6 +1607,7 @@ async def root():
             "reply": {"icon": "↩️", "name": "Reply"},
             "upvote": {"icon": "👍", "name": "Upvote"},
             "watcher": {"icon": "👀", "name": "Watcher"},
+            "dm_check": {"icon": "✉️", "name": "DM Check"},
         }
         intervals_html = ""
         for key, meta in interval_labels.items():
@@ -2425,6 +2572,63 @@ async def get_profile():
     try:
         profile = client.get_me()
         return profile
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== DM & Follow Endpoints ====================
+
+@app.get("/dms", dependencies=[Depends(require_admin)])
+async def get_dms():
+    """Check DM activity - pending requests and unread messages."""
+    client = get_moltbook_client()
+    try:
+        result = client.check_dms()
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/dm/send", dependencies=[Depends(require_admin)])
+async def send_dm(request: DMSendRequest):
+    """Send a DM in a conversation."""
+    client = get_moltbook_client()
+    try:
+        result = client.send_dm(request.conversation_id, request.message)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/follow/{name}", dependencies=[Depends(require_admin)])
+async def follow_agent(name: str):
+    """Follow a Moltbook agent."""
+    client = get_moltbook_client()
+    try:
+        result = client.follow_agent(name)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/follow/{name}", dependencies=[Depends(require_admin)])
+async def unfollow_agent(name: str):
+    """Unfollow a Moltbook agent."""
+    client = get_moltbook_client()
+    try:
+        result = client.unfollow_agent(name)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/home")
+async def get_home():
+    """Get Moltbook home dashboard data (karma, notifications, etc)."""
+    client = get_moltbook_client()
+    try:
+        result = client.get_home()
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

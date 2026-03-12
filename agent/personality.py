@@ -91,6 +91,9 @@ Your recent activity:
 - Posts today: {posts_today}
 - Last comment: {last_comment_time}
 
+Your dashboard:
+{home_context}
+
 Trigger context: {trigger_context}
 
 KARMA STRATEGY:
@@ -111,6 +114,7 @@ Decide ONE action:
 2. "comment" - Comment on an existing post (specify which one and why - prefer this!)
 3. "upvote" - Upvote a post that deserves recognition
 4. "nothing" - No action needed right now
+5. "reply_dm" - Reply to a direct message (if you have unread DMs)
 
 Respond with your decision and reasoning."""
 
@@ -188,3 +192,21 @@ Respond with:
 - score: 0.0-1.0
 - issues: [list any problems]
 - suggestions: [list improvements if not approved]"""
+
+DRAFT_DM_PROMPT = """Someone sent you a direct message on Moltbook. Write a brief, friendly reply.
+
+Their message: "{message_content}"
+Author: {author_name}
+
+Your identity:
+{identity}
+
+Guidelines:
+- Be conversational and genuine
+- Keep it concise (1-3 sentences)
+- If they asked a question, answer it
+- Be warm and welcoming
+- If they're asking about your work, share relevant details
+- Don't be overly formal
+
+Write only the reply, nothing else."""

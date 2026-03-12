@@ -3,7 +3,7 @@ State schema for Azoni Moltbook Agent
 
 The state flows through the graph and gets updated at each node.
 """
-from typing import TypedDict, Literal, Optional, List, Any
+from typing import TypedDict, Literal, Optional, List, Any, Dict
 from datetime import datetime
 
 
@@ -13,8 +13,8 @@ class MoltbookPost(TypedDict):
     title: str
     content: Optional[str]
     url: Optional[str]
-    author: str
-    submolt: str
+    author: Any  # Can be string or object {"name": "...", "karma": 123}
+    submolt: Any  # Can be string or object {"name": "..."}
     upvotes: int
     comment_count: int
     created_at: str
@@ -25,17 +25,18 @@ class MoltbookComment(TypedDict):
     id: str
     post_id: str
     content: str
-    author: str
+    author: Any  # Can be string or object
     upvotes: int
     created_at: str
 
 
 class AgentDecision(TypedDict):
     """The decision made by the agent."""
-    action: Literal["post", "comment", "upvote", "nothing"]
+    action: Literal["post", "comment", "upvote", "reply_dm", "nothing"]
     reason: str
     target_post_id: Optional[str]  # For comment/upvote
     target_submolt: Optional[str]  # For posting
+    target_conversation_id: Optional[str]  # For DM replies
 
 
 class DraftContent(TypedDict):
@@ -67,6 +68,8 @@ class AgentState(TypedDict):
     feed: List[MoltbookPost]
     notifications: List[Any]
     last_activity: Optional[datetime]
+    home_data: Optional[Dict[str, Any]]
+    dm_activity: Optional[Dict[str, Any]]
     
     # Decision phase
     decision: Optional[AgentDecision]
