@@ -1341,6 +1341,10 @@ class RegisterRequest(BaseModel):
     description: str = settings.agent_description
 
 
+class SetupOwnerEmailRequest(BaseModel):
+    email: str
+
+
 class ManualRunRequest(BaseModel):
     context: Optional[str] = None
 
@@ -2317,6 +2321,21 @@ async def register_agent(request: RegisterRequest):
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/setup-owner-email", dependencies=[Depends(require_admin)])
+async def setup_owner_email(request: SetupOwnerEmailRequest):
+    """Proxy setup-owner-email to Moltbook using the configured API key."""
+    client = get_moltbook_client()
+    try:
+        response = client._request(
+            "post",
+            f"{client.base_url}/agents/me/setup-owner-email",
+            json={"email": request.email}
+        )
+        return response.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @app.post("/run", dependencies=[Depends(require_admin)])
