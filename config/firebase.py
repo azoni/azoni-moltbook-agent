@@ -62,3 +62,30 @@ MOLTBOOK_CONFIG = "moltbook_config"
 MOLTBOOK_ACTIVITY = "moltbook_activity"
 MOLTBOOK_STATE = "moltbook_state"
 MOLTBOOK_JOB_HISTORY = "moltbook_job_history"
+AGENT_ACTIVITY = "agent_activity"
+
+
+def log_to_ecosystem(action, title, description=""):
+    """Fire-and-forget: log moltbook activity to MCP ecosystem feed."""
+    import json, urllib.request, threading
+    mcp_url = os.environ.get('MCP_URL', 'https://azoni-mcp.onrender.com')
+    mcp_key = os.environ.get('MCP_ADMIN_KEY')
+    if not mcp_key:
+        return
+    type_map = {"post": "moltbook_post", "comment": "moltbook_comment", "upvote": "moltbook_upvote"}
+    def _send():
+        try:
+            data = json.dumps({
+                'type': type_map.get(action, f'moltbook_{action}'),
+                'title': title,
+                'source': 'moltbook-agent',
+                'description': (description or '')[:500],
+            }).encode()
+            req = urllib.request.Request(
+                f'{mcp_url}/activity/log', data=data,
+                headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {mcp_key}'},
+            )
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            pass
+    threading.Thread(target=_send, daemon=True).start()
