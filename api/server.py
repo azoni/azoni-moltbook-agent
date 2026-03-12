@@ -1304,7 +1304,10 @@ async def lifespan(app: FastAPI):
     # Run health check 10 seconds after startup
     from apscheduler.triggers.date import DateTrigger
     scheduler.add_job(startup_check, DateTrigger(run_date=datetime.now() + timedelta(seconds=10)), id="startup_check")
-    
+
+    # Run post job 2 min after startup so Render free-tier restarts don't starve it
+    scheduler.add_job(post_job, DateTrigger(run_date=datetime.now() + timedelta(minutes=2)), id="startup_post", replace_existing=True)
+
     scheduler.start()
     intervals = get_intervals()
     logger.info(f"Scheduler started with dynamic intervals: {intervals}")
