@@ -172,7 +172,8 @@ def _get_cached_moltbook_status():
 
 
 # Default intervals (minutes)
-DEFAULT_INTERVALS = {"post": 45, "comment": 10, "reply": 8, "upvote": 15, "watcher": 5, "dm_check": 15}
+# Moltbook limits: 1 post/30min, 1 comment/20sec + 50/day, 30 writes/min
+DEFAULT_INTERVALS = {"post": 35, "comment": 25, "reply": 20, "upvote": 15, "watcher": 5, "dm_check": 15}
 
 
 def require_admin(x_admin_key: Optional[str] = Header(None)):
