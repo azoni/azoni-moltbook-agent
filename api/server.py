@@ -2338,6 +2338,46 @@ async def setup_owner_email(request: SetupOwnerEmailRequest):
         raise HTTPException(status_code=502, detail=str(e))
 
 
+class UpdateApiKeyRequest(BaseModel):
+    api_key: str
+
+
+@app.post("/update-api-key", dependencies=[Depends(require_admin)])
+async def update_api_key(request: UpdateApiKeyRequest):
+    """Update the Moltbook API key at runtime and persist to Firestore."""
+    # Update in memory
+    settings.moltbook_api_key = request.api_key
+
+    # Clear cached status so next check uses new key
+    _status_cache["data"] = None
+    _status_cache["timestamp"] = 0
+
+    # Persist to Firestore
+    def _save():
+        db = get_firestore()
+        db.collection(MOLTBOOK_CONFIG).document("credentials").update({
+            "api_key": request.api_key,
+            "updated_at": datetime.now()
+        })
+    fs_call(_save, fallback=None, op="writes", count=1)
+
+    # Test the new key
+    try:
+        client = MoltbookClient(api_key=request.api_key)
+        status = client.get_status_fast()
+        return {
+            "success": True,
+            "moltbook_status": status.get("status"),
+            "message": "API key updated. Also update MOLTBOOK_API_KEY in Render env vars for persistence across restarts."
+        }
+    except Exception as e:
+        return {
+            "success": True,
+            "moltbook_status": f"error: {e}",
+            "message": "Key saved but couldn't verify with Moltbook. Also update MOLTBOOK_API_KEY in Render env vars."
+        }
+
+
 @app.post("/run", dependencies=[Depends(require_admin)])
 async def manual_run(request: ManualRunRequest, background_tasks: BackgroundTasks):
     """
