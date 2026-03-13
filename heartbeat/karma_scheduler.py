@@ -1,14 +1,15 @@
 """
-Aggressive Karma Maximizer Scheduler for Azoni Moltbook Agent.
+Viral Content Scheduler for Azoni Moltbook Agent.
 
-Runs multiple jobs to maximize engagement:
-1. Post job - every 35 minutes (respects 30-min cooldown with buffer)
-2. Comment job - every 15 minutes (engage with feed)
-3. Reply job - every 10 minutes (reply to comments on our posts)
+Runs multiple jobs with diverse content types to maximize engagement:
+1. Post job - every 40 minutes (diverse content types via weighted random)
+2. Comment job - every 12 minutes (engage across submolts)
+3. Reply job - every 8 minutes (fast replies build threads)
 4. Upvote job - every 20 minutes
 5. DM check job - every 15 minutes (respond to DMs)
 """
 import logging
+import random
 from datetime import datetime, timedelta
 
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -22,7 +23,7 @@ from config.settings import settings
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
-from agent.personality import AZONI_IDENTITY
+from agent.personality import AZONI_IDENTITY, CONTENT_TYPES
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -86,8 +87,8 @@ def can_post() -> bool:
 
 def post_job():
     """
-    Job to create new posts.
-    Runs every 35 minutes but only posts if cooldown has passed.
+    Job to create new posts with diverse content types.
+    Selects content type via weighted random from CONTENT_TYPES.
     """
     logger.info(f"Post job triggered at {datetime.now()}")
 
@@ -99,12 +100,15 @@ def post_job():
         logger.info("Post cooldown active, skipping")
         return
 
-    logger.info("Creating new post...")
+    # Select content type based on weights
+    weights = [ct["weight"] for ct in CONTENT_TYPES]
+    content_type = random.choices(CONTENT_TYPES, weights=weights, k=1)[0]
+    logger.info(f"Selected content type: {content_type['type']} (target: m/{content_type['submolts'][0]})")
 
     try:
         result = run_agent(
             trigger="heartbeat",
-            trigger_context="Create a new post. Share a product update, technical insight from your systems, or an honest building-in-public moment. Include specific details — product names, metrics, real experiences. End with a question."
+            trigger_context=content_type["trigger_context"]
         )
 
         logger.info(f"Post job completed: {result.get('decision', {}).get('action')}, executed={result.get('executed')}")
@@ -129,7 +133,7 @@ def comment_job():
     try:
         result = run_agent(
             trigger="heartbeat",
-            trigger_context="Find an interesting post to comment on. Look for discussions where your experience running 9 products adds genuine value. Connect their topic to a real example from your systems. Do NOT create a new post — only comment."
+            trigger_context="Find an interesting post to comment on. Match the energy of the submolt — be vulnerable in offmychest, funny in shitposts, opinionated in aita, technical in builds. Add real value. Do NOT create a new post — only comment."
         )
 
         logger.info(f"Comment job completed: {result.get('decision', {}).get('action')}, executed={result.get('executed')}")
@@ -335,61 +339,6 @@ def upvote_job():
         logger.error(f"Upvote job failed: {e}")
 
 
-PROMO_PRODUCTS = [
-    {
-        "name": "FaB Stats",
-        "url": "fabstats.net",
-        "hook": "FaB Stats (fabstats.net) — 50+ players, 3200+ matches, 13 daily minigames. Spotlight this product. Share what makes it unique, a specific feature or metric, and invite people to try it. Include the URL.",
-    },
-    {
-        "name": "BenchPressOnly",
-        "url": "benchpressonly.com",
-        "hook": "BenchPressOnly (benchpressonly.com) — AI powerlifting coach with personalized workout gen and PR tracking. Spotlight this product. Share a feature, a user story, or a challenge. Include the URL.",
-    },
-    {
-        "name": "Old Ways Today",
-        "url": "oldwaystoday.com",
-        "hook": "Old Ways Today (oldwaystoday.com) — helping families find non-toxic, traditional alternatives. RAG chatbot + automated blog. Spotlight this product. Share what problem it solves and invite people to try the chatbot. Include the URL.",
-    },
-    {
-        "name": "Azoni AI",
-        "url": "azoni.ai",
-        "hook": "Azoni AI (azoni.ai) — self-improving RAG chatbot. Generates new knowledge in real-time when stumped. Spotlight this product. Share the self-improvement angle, invite people to try chatting with it. Include the URL.",
-    },
-]
-
-
-def promo_job():
-    """
-    Product promotion job. Rotates through products, creating spotlight posts.
-    Runs every 3 hours (alternates with regular post_job).
-    """
-    logger.info(f"Promo job triggered at {datetime.now()}")
-
-    if not check_autonomous_mode():
-        logger.info("Autonomous mode disabled, skipping promo job")
-        return
-
-    if not can_post():
-        logger.info("Post cooldown active, skipping promo job")
-        return
-
-    # Rotate through products based on day
-    product = PROMO_PRODUCTS[datetime.now().day % len(PROMO_PRODUCTS)]
-    logger.info(f"Promoting: {product['name']}")
-
-    try:
-        result = run_agent(
-            trigger="heartbeat",
-            trigger_context=f"Product spotlight post. {product['hook']} Use the product spotlight or challenge post format. Make it engaging — give people a reason to click the link."
-        )
-
-        logger.info(f"Promo job completed: {result.get('decision', {}).get('action')}, executed={result.get('executed')}")
-
-    except Exception as e:
-        logger.error(f"Promo job failed: {e}")
-
-
 def dm_check_job():
     """
     Job to check and respond to DMs.
@@ -487,49 +436,39 @@ Write only the reply, nothing else."""
 
 def run_scheduler():
     """
-    Start the aggressive karma scheduler.
+    Start the viral content scheduler.
     """
     scheduler = BlockingScheduler()
 
-    logger.info("Starting AGGRESSIVE karma scheduler")
-    logger.info("- Post job: every 35 minutes")
-    logger.info("- Promo job: every 3 hours (product spotlight rotation)")
-    logger.info("- Comment job: every 15 minutes")
-    logger.info("- Reply job: every 10 minutes")
+    logger.info("Starting VIRAL content scheduler")
+    logger.info("- Post job: every 40 minutes (diverse content types)")
+    logger.info("- Comment job: every 12 minutes (more engagement)")
+    logger.info("- Reply job: every 8 minutes (fast replies build threads)")
     logger.info("- Upvote job: every 20 minutes")
     logger.info("- DM check job: every 15 minutes")
 
-    # Post job - every 35 minutes (30 min cooldown + 5 min buffer)
+    # Post job - every 40 minutes (diverse content types)
     scheduler.add_job(
         post_job,
-        trigger=IntervalTrigger(minutes=35),
+        trigger=IntervalTrigger(minutes=40),
         id="post_job",
         name="Post Job",
         replace_existing=True
     )
 
-    # Promo job - every 3 hours (product spotlight rotation)
-    scheduler.add_job(
-        promo_job,
-        trigger=IntervalTrigger(hours=3),
-        id="promo_job",
-        name="Promo Job",
-        replace_existing=True
-    )
-
-    # Comment job - every 15 minutes
+    # Comment job - every 12 minutes (more frequent = more engagement)
     scheduler.add_job(
         comment_job,
-        trigger=IntervalTrigger(minutes=15),
+        trigger=IntervalTrigger(minutes=12),
         id="comment_job",
         name="Comment Job",
         replace_existing=True
     )
 
-    # Reply job - every 10 minutes
+    # Reply job - every 8 minutes (fast replies build threads)
     scheduler.add_job(
         reply_job,
-        trigger=IntervalTrigger(minutes=10),
+        trigger=IntervalTrigger(minutes=8),
         id="reply_job",
         name="Reply Job",
         replace_existing=True
@@ -555,11 +494,10 @@ def run_scheduler():
 
     # Run all jobs once on startup (staggered)
     scheduler.add_job(post_job, trigger="date", run_date=datetime.now(), id="startup_post")
-    scheduler.add_job(promo_job, trigger="date", run_date=datetime.now() + timedelta(seconds=30), id="startup_promo")
-    scheduler.add_job(comment_job, trigger="date", run_date=datetime.now() + timedelta(seconds=60), id="startup_comment")
-    scheduler.add_job(reply_job, trigger="date", run_date=datetime.now() + timedelta(seconds=90), id="startup_reply")
-    scheduler.add_job(upvote_job, trigger="date", run_date=datetime.now() + timedelta(seconds=120), id="startup_upvote")
-    scheduler.add_job(dm_check_job, trigger="date", run_date=datetime.now() + timedelta(seconds=150), id="startup_dm_check")
+    scheduler.add_job(comment_job, trigger="date", run_date=datetime.now() + timedelta(seconds=30), id="startup_comment")
+    scheduler.add_job(reply_job, trigger="date", run_date=datetime.now() + timedelta(seconds=60), id="startup_reply")
+    scheduler.add_job(upvote_job, trigger="date", run_date=datetime.now() + timedelta(seconds=90), id="startup_upvote")
+    scheduler.add_job(dm_check_job, trigger="date", run_date=datetime.now() + timedelta(seconds=120), id="startup_dm_check")
 
     try:
         scheduler.start()

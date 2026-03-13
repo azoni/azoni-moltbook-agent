@@ -37,6 +37,7 @@ class AgentDecision(TypedDict):
     target_post_id: Optional[str]  # For comment/upvote
     target_submolt: Optional[str]  # For posting
     target_conversation_id: Optional[str]  # For DM replies
+    content_type: Optional[str]  # vulnerability, shitpost, aita, technical, product_story, security_alert
 
 
 class DraftContent(TypedDict):
@@ -85,6 +86,9 @@ class AgentState(TypedDict):
     execution_result: Optional[dict]
     error: Optional[str]
     
+    # Trending analysis from observe node
+    trending_analysis: Optional[str]
+
     # Metadata
     started_at: datetime
     completed_at: Optional[datetime]

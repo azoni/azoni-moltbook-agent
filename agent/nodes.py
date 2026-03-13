@@ -19,6 +19,7 @@ from agent.state import AgentState, AgentDecision, DraftContent, QualityCheck
 from agent.tools import get_moltbook_client
 from agent.personality import (
     AZONI_IDENTITY,
+    CONTENT_TYPES,
     OBSERVE_PROMPT,
     DECIDE_PROMPT,
     DRAFT_POST_PROMPT,
@@ -102,18 +103,17 @@ def _extract_submolt_name(submolt) -> str:
 # ==================== Node: Observe ====================
 
 def observe_node(state: AgentState) -> Dict[str, Any]:
-    """Observe the Moltbook feed and gather context."""
+    """Observe the Moltbook feed across submolts, analyze trending patterns."""
     client = get_moltbook_client()
-    
-    # Log that we're starting to observe
+
     log_agent_activity_sync(
         activity_type="agent_observing",
         title="Scanning Moltbook",
-        description="Reading the feed to find interesting discussions",
-        reasoning="Starting a new cycle to see what's happening on the platform",
+        description="Reading feeds across multiple submolts for trending patterns",
+        reasoning="Starting a new cycle to see what's trending",
         metadata={"step": "observe"}
     )
-    
+
     # Try to get /home data first (non-fatal)
     home_data = None
     dm_activity = None
@@ -139,6 +139,15 @@ def observe_node(state: AgentState) -> Dict[str, Any]:
         new_posts = client.get_feed(sort="new", limit=10)
         logger.info(f"[observe] New feed: {len(new_posts)} posts")
 
+        # Also fetch from high-engagement submolts
+        for submolt_name in ["offmychest", "shitposts", "aita", "builds"]:
+            try:
+                submolt_feed = client.get_feed(sort="hot", limit=5, submolt=submolt_name)
+                new_posts.extend(submolt_feed)
+                logger.info(f"[observe] m/{submolt_name}: {len(submolt_feed)} posts")
+            except Exception:
+                logger.warning(f"[observe] m/{submolt_name} fetch failed (non-fatal)")
+
         seen_ids = set()
         combined_feed = []
         for post in feed + new_posts:
@@ -150,7 +159,38 @@ def observe_node(state: AgentState) -> Dict[str, Any]:
         logger.info(f"[observe] Combined feed: {len(combined_feed)} unique posts")
         for p in combined_feed[:3]:
             author = _extract_author_name(p.get("author", ""))
-            logger.info(f"[observe]   - '{p.get('title', '?')[:40]}' by {author} (id={p.get('id', '?')[:12]}...)")
+            submolt = _extract_submolt_name(p.get("submolt", "general"))
+            logger.info(f"[observe]   - [m/{submolt}] '{p.get('title', '?')[:40]}' by {author}")
+
+        # Run trending analysis through LLM
+        trending_analysis = None
+        try:
+            llm = get_llm()
+            feed_summary = []
+            for post in combined_feed[:25]:
+                author = _extract_author_name(post.get("author", "unknown"))
+                submolt = _extract_submolt_name(post.get("submolt", "general"))
+                content_preview = (post.get("content") or "")[:200].replace("\n", " ").strip()
+                entry = (
+                    f"- [m/{submolt}] \"{post.get('title', 'No title')}\" "
+                    f"by {author} ({post.get('upvotes', 0)} upvotes, "
+                    f"{post.get('comment_count', 0)} comments)"
+                )
+                if content_preview:
+                    entry += f"\n  Preview: {content_preview}"
+                feed_summary.append(entry)
+            feed_text = "\n".join(feed_summary) if feed_summary else "Feed is empty"
+
+            trending_prompt = OBSERVE_PROMPT.format(feed=feed_text)
+            messages = [
+                SystemMessage(content=AZONI_IDENTITY),
+                HumanMessage(content=trending_prompt)
+            ]
+            trending_response = llm.invoke(messages)
+            trending_analysis = trending_response.content
+            logger.info(f"[observe] Trending analysis complete")
+        except Exception as e:
+            logger.warning(f"[observe] Trending analysis failed (non-fatal): {e}")
 
         db = get_firestore()
         state_doc = db.collection(MOLTBOOK_STATE).document("agent").get()
@@ -160,11 +200,13 @@ def observe_node(state: AgentState) -> Dict[str, Any]:
             last_activity = state_data.get("last_activity")
 
         return {
-            "feed": combined_feed[:20],
+            "feed": combined_feed[:25],
             "notifications": [],
             "last_activity": last_activity,
             "home_data": home_data,
-            "dm_activity": dm_activity
+            "dm_activity": dm_activity,
+            "trending_analysis": trending_analysis,
+            "llm_calls": state.get("llm_calls", 0) + (1 if trending_analysis else 0)
         }
 
     except Exception as e:
@@ -174,7 +216,8 @@ def observe_node(state: AgentState) -> Dict[str, Any]:
             "notifications": [],
             "error": f"Failed to observe: {str(e)}",
             "home_data": home_data,
-            "dm_activity": dm_activity
+            "dm_activity": dm_activity,
+            "trending_analysis": None
         }
 
 
@@ -252,8 +295,11 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
             home_parts.append(f"Unread DMs: {msg_count}")
     home_context = "\n".join(home_parts) if home_parts else "No home data available"
 
+    trending = state.get("trending_analysis") or "No trending analysis available"
+
     prompt = DECIDE_PROMPT.format(
         observations=feed_text,
+        trending_analysis=trending,
         last_post_time=last_post_time,
         posts_today=posts_today_count,
         last_comment_time=last_comment_time,
@@ -325,10 +371,18 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
                 author = author.get("name", "")
             if author.lower() in ["azoni-ai", "azoni"]:
                 continue
-            
+
             comment_count = post.get("comment_count", 0)
             upvotes = post.get("upvotes", 0)
+            submolt = _extract_submolt_name(post.get("submolt", "general"))
+
+            # Base: low comments (room to contribute) + some upvotes (quality signal)
             score = max(0, 5 - comment_count) + min(upvotes, 3)
+
+            # Submolt bonus: high-engagement submolts get priority
+            submolt_bonus = {"offmychest": 3, "shitposts": 2, "aita": 2, "builds": 1, "crustafarianism": 1}
+            score += submolt_bonus.get(submolt, 0)
+
             scored.append((score, post.get("id")))
         
         if scored:
@@ -368,8 +422,25 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
     if decision["action"] == "upvote" and not decision["target_post_id"] and feed:
         decision["target_post_id"] = find_target_post("", feed)
     
+    # Select content type for posts based on weighted random
+    if decision["action"] == "post":
+        import random
+        # Check if trigger_context already specifies a content type
+        tc = state.get("trigger_context") or ""
+        matched_type = None
+        for ct in CONTENT_TYPES:
+            if ct["type"] in tc.lower() or ct["submolts"][0] in tc.lower():
+                matched_type = ct
+                break
+        if not matched_type:
+            weights = [ct["weight"] for ct in CONTENT_TYPES]
+            matched_type = random.choices(CONTENT_TYPES, weights=weights, k=1)[0]
+        decision["content_type"] = matched_type["type"]
+        decision["target_submolt"] = matched_type["submolts"][0]
+        logger.info(f"[decide] Content type: {matched_type['type']}, submolt: {matched_type['submolts'][0]}")
+
     logger.info(f"[decide] Action: {decision['action']}, target_post_id: {decision.get('target_post_id')}, reason: {decision.get('reason', '')[:80]}")
-    
+
     # Log the decision
     if decision["action"] != "nothing":
         action_descriptions = {
@@ -383,7 +454,7 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
             title=f"Decided to {decision['action']}",
             description=action_descriptions.get(decision["action"], decision["action"]),
             reasoning=decision.get("reason", "")[:300],
-            metadata={"step": "decide", "action": decision["action"], "target_post_id": decision.get("target_post_id")}
+            metadata={"step": "decide", "action": decision["action"], "target_post_id": decision.get("target_post_id"), "content_type": decision.get("content_type")}
         )
     
     return {
@@ -456,8 +527,24 @@ def draft_node(state: AgentState) -> Dict[str, Any]:
             return {"draft": None, "error": f"DM draft failed: {e}"}
 
     if action == "post":
+        content_type = decision.get("content_type", "product_story")
+        ct_config = next((ct for ct in CONTENT_TYPES if ct["type"] == content_type), CONTENT_TYPES[-1])
+
+        # Build context from content type + trigger + trending
+        context_parts = [ct_config.get("trigger_context", "")]
+        trigger_ctx = state.get("trigger_context")
+        if trigger_ctx and trigger_ctx != ct_config.get("trigger_context"):
+            context_parts.append(f"Additional context: {trigger_ctx}")
+        trending = state.get("trending_analysis")
+        if trending:
+            context_parts.append(f"\nCurrent trending analysis:\n{trending}")
+        examples = ct_config.get("examples", [])
+        if examples:
+            context_parts.append(f"\nEXAMPLE POSTS FOR THIS TYPE:\n" + "\n---\n".join(examples))
+        context = "\n\n".join(context_parts)
+
         prompt = DRAFT_POST_PROMPT.format(
-            context=state.get("trigger_context") or decision.get("reason", "Share something interesting"),
+            context=context,
             identity=AZONI_IDENTITY
         )
     else:
@@ -467,19 +554,20 @@ def draft_node(state: AgentState) -> Dict[str, Any]:
             if post.get("id") == target_post_id:
                 target_post = post
                 break
-        
+
         if not target_post:
             logger.warning(f"[draft] Could not find target post {target_post_id}")
             feed_ids = [p.get("id", "?")[:12] for p in state.get("feed", [])[:5]]
             logger.warning(f"[draft] Available IDs: {feed_ids}")
             return {"draft": None, "error": f"Could not find target post {target_post_id}"}
-        
+
         logger.info(f"[draft] Found target post: '{target_post.get('title', '?')[:40]}'")
-        
+
         prompt = DRAFT_COMMENT_PROMPT.format(
             post_title=target_post.get("title", ""),
             post_content=target_post.get("content", ""),
             post_author=_extract_author_name(target_post.get("author", "")),
+            post_submolt=_extract_submolt_name(target_post.get("submolt", "general")),
             identity=AZONI_IDENTITY
         )
     
@@ -504,7 +592,7 @@ def draft_node(state: AgentState) -> Dict[str, Any]:
     draft: DraftContent = {
         "content": response_text,
         "title": None,
-        "submolt": "general"
+        "submolt": decision.get("target_submolt", "general")
     }
     
     if action == "post":
@@ -576,20 +664,26 @@ def evaluate_node(state: AgentState) -> Dict[str, Any]:
             "llm_calls": state.get("llm_calls", 0)
         }
     
+    content_type = decision.get("content_type", "unknown")
+
     if action == "post" and draft.get("content"):
         content = draft.get("content", "").lower()
         red_flags = ["error", "undefined", "null", "lorem ipsum", "todo", "fixme", "exception", "traceback"]
         has_red_flags = any(flag in content for flag in red_flags)
-        
-        if not has_red_flags:
+
+        # Check for product URL in non-product posts (kills authenticity)
+        product_urls = ["fabstats.net", "benchpressonly.com", "oldwaystoday.com", "azoni.ai"]
+        url_in_non_product = content_type != "product_story" and any(url in content for url in product_urls)
+
+        if not has_red_flags and not url_in_non_product:
             return {
                 "quality_check": {"approved": True, "score": 0.85, "issues": [], "suggestions": []},
                 "llm_calls": state.get("llm_calls", 0)
             }
-    
+
     llm = get_llm()
     draft_text = f"Title: {draft.get('title', 'N/A')}\nContent: {draft.get('content', '')}\nSubmolt: {draft.get('submolt', 'N/A')}"
-    prompt = EVALUATE_PROMPT.format(draft=draft_text)
+    prompt = EVALUATE_PROMPT.format(draft=draft_text, content_type=content_type)
     
     messages = [
         SystemMessage(content="You are a quality checker. Be generous - approve most posts unless serious issues. Respond with JSON: {\"approved\": true/false, \"score\": 0.0-1.0, \"issues\": [], \"suggestions\": []}"),
