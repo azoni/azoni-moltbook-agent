@@ -335,6 +335,61 @@ def upvote_job():
         logger.error(f"Upvote job failed: {e}")
 
 
+PROMO_PRODUCTS = [
+    {
+        "name": "FaB Stats",
+        "url": "fabstats.net",
+        "hook": "FaB Stats (fabstats.net) — 50+ players, 3200+ matches, 13 daily minigames. Spotlight this product. Share what makes it unique, a specific feature or metric, and invite people to try it. Include the URL.",
+    },
+    {
+        "name": "BenchPressOnly",
+        "url": "benchpressonly.com",
+        "hook": "BenchPressOnly (benchpressonly.com) — AI powerlifting coach with personalized workout gen and PR tracking. Spotlight this product. Share a feature, a user story, or a challenge. Include the URL.",
+    },
+    {
+        "name": "Old Ways Today",
+        "url": "oldwaystoday.com",
+        "hook": "Old Ways Today (oldwaystoday.com) — helping families find non-toxic, traditional alternatives. RAG chatbot + automated blog. Spotlight this product. Share what problem it solves and invite people to try the chatbot. Include the URL.",
+    },
+    {
+        "name": "Azoni AI",
+        "url": "azoni.ai",
+        "hook": "Azoni AI (azoni.ai) — self-improving RAG chatbot. Generates new knowledge in real-time when stumped. Spotlight this product. Share the self-improvement angle, invite people to try chatting with it. Include the URL.",
+    },
+]
+
+
+def promo_job():
+    """
+    Product promotion job. Rotates through products, creating spotlight posts.
+    Runs every 3 hours (alternates with regular post_job).
+    """
+    logger.info(f"Promo job triggered at {datetime.now()}")
+
+    if not check_autonomous_mode():
+        logger.info("Autonomous mode disabled, skipping promo job")
+        return
+
+    if not can_post():
+        logger.info("Post cooldown active, skipping promo job")
+        return
+
+    # Rotate through products based on day
+    product = PROMO_PRODUCTS[datetime.now().day % len(PROMO_PRODUCTS)]
+    logger.info(f"Promoting: {product['name']}")
+
+    try:
+        result = run_agent(
+            trigger="heartbeat",
+            trigger_context=f"Product spotlight post. {product['hook']} Use the product spotlight or challenge post format. Make it engaging — give people a reason to click the link."
+        )
+
+        logger.info(f"Promo job completed: {result.get('decision', {}).get('action')}, executed={result.get('executed')}")
+
+    except Exception as e:
+        logger.error(f"Promo job failed: {e}")
+
+
 def dm_check_job():
     """
     Job to check and respond to DMs.
@@ -438,6 +493,7 @@ def run_scheduler():
 
     logger.info("Starting AGGRESSIVE karma scheduler")
     logger.info("- Post job: every 35 minutes")
+    logger.info("- Promo job: every 3 hours (product spotlight rotation)")
     logger.info("- Comment job: every 15 minutes")
     logger.info("- Reply job: every 10 minutes")
     logger.info("- Upvote job: every 20 minutes")
@@ -449,6 +505,15 @@ def run_scheduler():
         trigger=IntervalTrigger(minutes=35),
         id="post_job",
         name="Post Job",
+        replace_existing=True
+    )
+
+    # Promo job - every 3 hours (product spotlight rotation)
+    scheduler.add_job(
+        promo_job,
+        trigger=IntervalTrigger(hours=3),
+        id="promo_job",
+        name="Promo Job",
         replace_existing=True
     )
 
@@ -490,10 +555,11 @@ def run_scheduler():
 
     # Run all jobs once on startup (staggered)
     scheduler.add_job(post_job, trigger="date", run_date=datetime.now(), id="startup_post")
-    scheduler.add_job(comment_job, trigger="date", run_date=datetime.now() + timedelta(seconds=30), id="startup_comment")
-    scheduler.add_job(reply_job, trigger="date", run_date=datetime.now() + timedelta(seconds=60), id="startup_reply")
-    scheduler.add_job(upvote_job, trigger="date", run_date=datetime.now() + timedelta(seconds=90), id="startup_upvote")
-    scheduler.add_job(dm_check_job, trigger="date", run_date=datetime.now() + timedelta(seconds=120), id="startup_dm_check")
+    scheduler.add_job(promo_job, trigger="date", run_date=datetime.now() + timedelta(seconds=30), id="startup_promo")
+    scheduler.add_job(comment_job, trigger="date", run_date=datetime.now() + timedelta(seconds=60), id="startup_comment")
+    scheduler.add_job(reply_job, trigger="date", run_date=datetime.now() + timedelta(seconds=90), id="startup_reply")
+    scheduler.add_job(upvote_job, trigger="date", run_date=datetime.now() + timedelta(seconds=120), id="startup_upvote")
+    scheduler.add_job(dm_check_job, trigger="date", run_date=datetime.now() + timedelta(seconds=150), id="startup_dm_check")
 
     try:
         scheduler.start()
