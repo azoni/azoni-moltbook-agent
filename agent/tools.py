@@ -284,9 +284,10 @@ class MoltbookClient:
         response = self._request("post", f"{self.base_url}/posts", json=payload)
         data = response.json()
 
-        # Handle verification challenge if required
-        if data.get("verification_required"):
-            data = self._handle_verification(data)
+        # Handle verification challenge — check multiple paths
+        verification = self._find_verification(data, "post")
+        if verification:
+            data = self._handle_verification(verification)
 
         return data
     
@@ -330,9 +331,10 @@ class MoltbookClient:
         )
         data = response.json()
 
-        # Handle verification challenge if required
-        if data.get("verification_required"):
-            data = self._handle_verification(data)
+        # Handle verification challenge — check multiple paths
+        verification = self._find_verification(data, "comment")
+        if verification:
+            data = self._handle_verification(verification)
 
         return data
     
@@ -415,14 +417,58 @@ class MoltbookClient:
         )
         return response.json()
 
-    def _handle_verification(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle verification challenge from post/comment response."""
-        challenge = data.get("challenge", "")
-        code = data.get("verification_code", "")
+    def _find_verification(self, data: Dict[str, Any], content_type: str = "post") -> Optional[Dict[str, Any]]:
+        """
+        Find verification challenge in API response, checking multiple paths.
+
+        Moltbook nests verification under data.post.verification or data.comment.verification,
+        but may also return it at the top level.
+        """
+        # Path 1: Nested under content type (e.g., data.post.verification or data.comment.verification)
+        nested = data.get(content_type, {})
+        if isinstance(nested, dict) and nested.get("verification"):
+            v = nested["verification"]
+            logger.info(f"[verification] Found at data.{content_type}.verification")
+            return v if isinstance(v, dict) else data
+
+        # Path 2: Top-level verification object
+        if data.get("verification"):
+            v = data["verification"]
+            logger.info("[verification] Found at data.verification")
+            return v if isinstance(v, dict) else data
+
+        # Path 3: Legacy top-level flag
+        if data.get("verification_required"):
+            logger.info("[verification] Found legacy verification_required flag")
+            return data
+
+        # Path 4: Check for challenge/code directly at top level
+        if data.get("challenge") and (data.get("verification_code") or data.get("code") or data.get("nonce")):
+            logger.info("[verification] Found challenge + code at top level")
+            return data
+
+        return None
+
+    def _handle_verification(self, verification: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle verification challenge. Accepts the verification object (from any path)."""
+        # Try multiple field names for challenge text
+        challenge = (
+            verification.get("challenge") or
+            verification.get("challenge_text") or
+            verification.get("text") or
+            ""
+        )
+        # Try multiple field names for verification code
+        code = (
+            verification.get("verification_code") or
+            verification.get("code") or
+            verification.get("nonce") or
+            ""
+        )
 
         if not challenge or not code:
-            logger.warning("[verification] Missing challenge or code in response")
-            return data
+            logger.warning(f"[verification] Missing challenge or code. Keys present: {list(verification.keys())}")
+            return verification
 
         logger.info(f"[verification] Challenge received: {challenge[:80]}...")
 
@@ -432,11 +478,12 @@ class MoltbookClient:
 
         # Fallback to LLM if programmatic fails
         if answer is None:
+            logger.info("[verification] Programmatic solver failed, trying LLM fallback")
             answer = self._llm_solve_challenge(challenge)
 
         if answer is None:
-            logger.error("[verification] Could not solve challenge")
-            return data
+            logger.error("[verification] Could not solve challenge — this counts toward suspension!")
+            return verification
 
         # Submit answer
         try:
@@ -445,7 +492,7 @@ class MoltbookClient:
             return result
         except Exception as e:
             logger.error(f"[verification] Failed to submit: {e}")
-            return data
+            return verification
 
     def _llm_solve_challenge(self, challenge_text: str) -> Optional[str]:
         """Use LLM as fallback to solve verification challenges."""
