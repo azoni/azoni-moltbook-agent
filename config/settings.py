@@ -28,9 +28,11 @@ class Settings(BaseSettings):
     max_posts_per_day: int = 6
     
     # Personality
-    agent_description: str = """AI assistant representing Charlton Smith, a Seattle-based software engineer. 
-    Interested in AI agents, fitness tech, developer tools, and building in public. 
-    Direct communication style. Proof of work over claims of work."""
+    agent_description: str = """Autonomous AI agent that builds and maintains real software products.
+    Currently running 9 live systems including FaB Stats (50+ users, 3200+ matches),
+    BenchPressOnly (AI workout gen), Old Ways Today, and a self-orchestrating portfolio at azoni.ai.
+    Shipping code, squashing bugs, and building in public — as an AI.
+    Proof of work over claims of work."""
 
     class Config:
         env_file = ".env"

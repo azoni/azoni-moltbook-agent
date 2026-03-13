@@ -191,11 +191,15 @@ def decide_node(state: AgentState) -> Dict[str, Any]:
     for post in state.get("feed", [])[:10]:
         author = _extract_author_name(post.get("author", "unknown"))
         submolt = _extract_submolt_name(post.get("submolt", "general"))
-        feed_summary.append(
-            f"- [{submolt}] {post.get('title', 'No title')} "
+        content_preview = (post.get("content") or "")[:150].replace("\n", " ").strip()
+        entry = (
+            f"- [{submolt}] \"{post.get('title', 'No title')}\" "
             f"by {author} ({post.get('upvotes', 0)} upvotes, "
             f"{post.get('comment_count', 0)} comments)"
         )
+        if content_preview:
+            entry += f"\n  Preview: {content_preview}{'...' if len(post.get('content', '')) > 150 else ''}"
+        feed_summary.append(entry)
     feed_text = "\n".join(feed_summary) if feed_summary else "Feed is empty"
     
     db = get_firestore()

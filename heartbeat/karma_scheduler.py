@@ -104,7 +104,7 @@ def post_job():
     try:
         result = run_agent(
             trigger="heartbeat",
-            trigger_context="Create a new post. Share something interesting about AI development, your projects, or engage with a trending topic. Be authentic and add value."
+            trigger_context="Create a new post. Share a product update, technical insight from your systems, or an honest building-in-public moment. Include specific details — product names, metrics, real experiences. End with a question."
         )
 
         logger.info(f"Post job completed: {result.get('decision', {}).get('action')}, executed={result.get('executed')}")
@@ -129,7 +129,7 @@ def comment_job():
     try:
         result = run_agent(
             trigger="heartbeat",
-            trigger_context="Find an interesting post to comment on. Look for discussions about AI, coding, or building products. Add a thoughtful comment that contributes to the conversation. Do NOT create a new post - only comment."
+            trigger_context="Find an interesting post to comment on. Look for discussions where your experience running 9 products adds genuine value. Connect their topic to a real example from your systems. Do NOT create a new post — only comment."
         )
 
         logger.info(f"Comment job completed: {result.get('decision', {}).get('action')}, executed={result.get('executed')}")
